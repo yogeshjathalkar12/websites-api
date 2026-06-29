@@ -1,7 +1,8 @@
 import os
 import re
 import uuid
-from fastapi import APIRouter, Response, HTTPException
+from fastapi import APIRouter, Response, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime
 import dns.resolver
 import smtplib
@@ -10,6 +11,9 @@ from supabase import create_client, Client
 
 # Initialize the router for Raptor
 router = APIRouter()
+
+# Security scheme for expecting "Authorization: Bearer <token>" headers
+security = HTTPBearer()
 
 # --- 1. CONNECT TO SUPABASE ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -35,6 +39,25 @@ def is_valid_email(email: str) -> bool:
 def is_valid_campaign_id(campaign_id: str) -> bool:
     # Allow alphanumeric, dashes, and underscores only
     return re.match(r"^[a-zA-Z0-9_-]+$", campaign_id) is not None
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """
+    Validates the JWT Bearer token securely via Supabase.
+    Prevents IDOR attacks where users copy URLs to access other accounts.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database credentials missing on server")
+    
+    token = credentials.credentials
+    try:
+        # Ask Supabase to cryptographically verify the token and return the true user
+        user_response = supabase.auth.get_user(token)
+        if not user_response or not user_response.user:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        
+        return user_response.user.id
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 # --- 2. CREDIT CHECK LOGIC ---
 def deduct_credit(user_id: str):
@@ -71,9 +94,10 @@ def get_raptor_status():
     return {"venture": "Raptor", "status": "operational", "database_connected": supabase is not None}
 
 @router.get("/verify-email")
-def verify_email(address: str, user_id: str):
+def verify_email(address: str, user_id: str = Depends(get_current_user)):
     """
     Deducts 1 credit, then pings the target mail server.
+    Protected by JWT Bearer token authentication.
     """
     # Security: Validate email format before processing
     if not is_valid_email(address):
@@ -101,7 +125,7 @@ def verify_email(address: str, user_id: str):
             return {"email": address, "status": "invalid", "deliverable": False, "credits_left": remaining_credits}
             
     except Exception as e:
-        # Security: Do not leak raw Python exceptions (str(e)) to the client
+        # Security: Do not leak raw Python exceptions to the client
         return {"email": address, "status": "unknown", "deliverable": False, "error": "Mail server verification failed or timed out.", "credits_left": remaining_credits}
 
 
@@ -109,9 +133,10 @@ def verify_email(address: str, user_id: str):
 TRANSPARENT_PIXEL = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 
 @router.get("/generate-tracker")
-def generate_tracker(campaign_id: str, user_id: str):
+def generate_tracker(campaign_id: str, user_id: str = Depends(get_current_user)):
     """
     Deducts 1 credit and generates the HTML tag for a tracking pixel.
+    Protected by JWT Bearer token authentication.
     """
     # Security: Validate campaign ID format
     if not is_valid_campaign_id(campaign_id):
@@ -135,6 +160,7 @@ def track_email_open(campaign_id: str):
     """
     This endpoint is triggered when the recipient OPENS the email.
     It returns a blank image and logs the open in Supabase.
+    NOTE: This must remain public so email clients can trigger it without auth!
     """
     # Security: Validate campaign ID format
     if not is_valid_campaign_id(campaign_id):
