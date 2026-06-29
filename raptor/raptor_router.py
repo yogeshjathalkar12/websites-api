@@ -133,16 +133,50 @@ def verify_email(address: str, user_id: str = Depends(get_current_user)):
 TRANSPARENT_PIXEL = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 
 @router.get("/generate-tracker")
-def generate_tracker(campaign_id: str, user_id: str = Depends(get_current_user)):
+def generate_tracker(campaign_id: str, display_name: str = None, user_id: str = Depends(get_current_user)):
     """
     Deducts 1 credit and generates the HTML tag for a tracking pixel.
     Protected by JWT Bearer token authentication.
+
+    display_name is the human-readable name the user typed (e.g.
+    "pitch-acmecorp-ceo") -- campaign_id is the sanitized, suffixed
+    slug used in the actual /track/ URL. We store both so the
+    dashboard can show a readable name after a page refresh instead
+    of just the slug.
     """
     # Security: Validate campaign ID format
     if not is_valid_campaign_id(campaign_id):
         raise HTTPException(status_code=400, detail="Malformed campaign ID. Use only letters, numbers, dashes, and underscores.")
 
+    # Security: cap length and strip control characters on the free-text
+    # display name before it ever reaches the database. PostgREST already
+    # parameterizes this query (no SQL injection risk), this is just
+    # basic input hygiene so a 10,000-character string can't be stored.
+    if display_name:
+        display_name = display_name.strip()[:120]
+        display_name = re.sub(r"[\x00-\x1f\x7f]", "", display_name)
+    if not display_name:
+        display_name = campaign_id
+
     remaining_credits = deduct_credit(user_id)
+
+    # Record ownership of this campaign_id so the dashboard can later
+    # ask "show me opens for MY campaigns only" without raptor_opens
+    # ever needing to know who owns what. This is what makes the
+    # /campaign-opens endpoint below safe to expose per-user.
+    # Uses the service-role key, so this bypasses RLS by design --
+    # raptor_campaigns has no client-facing policies at all.
+    try:
+        supabase.table("raptor_campaigns").insert({
+            "campaign_id": campaign_id,
+            "user_id": user_id,
+            "display_name": display_name
+        }).execute()
+    except Exception:
+        # If campaign_id collides (extremely unlikely given the random
+        # suffix appended client-side) we still return the tracker --
+        # worst case is that one campaign's opens aren't attributable.
+        pass
     
     # We use an Environment Variable for the URL so it's not hardcoded
     tracking_url = f"{API_BASE_URL}/api/raptor/track/{campaign_id}.png"
@@ -173,3 +207,63 @@ def track_email_open(campaign_id: str):
         supabase.table("raptor_opens").insert({"campaign_id": campaign_id}).execute()
         
     return Response(content=TRANSPARENT_PIXEL, media_type="image/png")
+
+
+@router.get("/campaign-opens")
+def get_campaign_opens(user_id: str = Depends(get_current_user)):
+    """
+    Returns open counts/timestamps for ONLY the calling user's own campaigns.
+    Protected by JWT Bearer token authentication.
+
+    raptor_opens has no user_id column and no RLS policies (by design --
+    it's only ever written by this backend's public /track endpoint).
+    This endpoint is the one safe, server-mediated way for the dashboard
+    to read open data: we first resolve which campaign_ids belong to the
+    verified user via raptor_campaigns, then query raptor_opens for just
+    those IDs using the service-role key (which bypasses RLS).
+
+    The frontend must NOT query raptor_opens directly from the browser --
+    there is nothing in that table to scope a query to "my campaigns only",
+    so an open client-side policy would leak every user's campaign opens.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database credentials missing on server")
+
+    # 1. Find which campaign_ids belong to this user, with their display names
+    owned = supabase.table("raptor_campaigns").select("campaign_id, display_name").eq("user_id", user_id).execute()
+    owned_rows = owned.data or []
+    campaign_ids = [row["campaign_id"] for row in owned_rows]
+    names_by_id = {row["campaign_id"]: (row.get("display_name") or row["campaign_id"]) for row in owned_rows}
+
+    if not campaign_ids:
+        return {"campaigns": []}
+
+    # 2. Fetch opens for exactly those campaign_ids, nothing else
+    opens_response = (
+        supabase.table("raptor_opens")
+        .select("campaign_id, opened_at")
+        .in_("campaign_id", campaign_ids)
+        .order("opened_at", desc=True)
+        .execute()
+    )
+    opens = opens_response.data or []
+
+    # 3. Aggregate per campaign: total opens + most recent open time
+    summary = {}
+    for row in opens:
+        cid = row["campaign_id"]
+        if cid not in summary:
+            summary[cid] = {"campaign_id": cid, "display_name": names_by_id.get(cid, cid), "opens": 0, "last_open": None}
+        summary[cid]["opens"] += 1
+        # opens is already sorted desc by opened_at, so the first hit per
+        # campaign_id is the most recent
+        if summary[cid]["last_open"] is None:
+            summary[cid]["last_open"] = row["opened_at"]
+
+    # Include campaigns with zero opens too, so the dashboard can show "Pending"
+    for cid in campaign_ids:
+        if cid not in summary:
+            summary[cid] = {"campaign_id": cid, "display_name": names_by_id.get(cid, cid), "opens": 0, "last_open": None}
+
+
+    return {"campaigns": list(summary.values())}
