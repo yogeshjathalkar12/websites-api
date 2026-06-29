@@ -1,10 +1,11 @@
-from fastapi import FastAPI
+pafrom fastapi 
+import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- 1. IMPORT YOUR VENTURES ---
 # These imports look for the 'router.py' file inside the 'raptor', 'civitas', and 'basis' folders.
 from raptor.router import router as raptor_router
-from civitas.router import router as civitas_router
+from civitas.civitasrouter import router as civitas_router
 from basis.router import router as basis_router
 
 # Initialize the main API hub
