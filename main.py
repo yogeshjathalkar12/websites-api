@@ -7,9 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # layout: raptor/raptor_router.py, basis/basis_router.py,
 # construct/construct_router.py.
 from raptor.raptor_router import router as raptor_router
-from basis.basis_router import router as basis_router
-from construct.construct_router import router as construct_router
-
 # Initialize the main API hub
 app = FastAPI(title="Websites Central API")
 
