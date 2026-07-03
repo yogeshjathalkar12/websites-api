@@ -48,5 +48,7 @@ def read_root():
 # --- 4. CONNECT YOUR VENTURE FOLDERS ---
 # This automatically routes requests like /api/raptor/... to the raptor folder
 app.include_router(raptor_router, prefix="/api/raptor", tags=["Raptor"])
-app.include_router(basis_router, prefix="/api/basis", tags=["Basis"])
-app.include_router(construct_router, prefix="/api/construct", tags=["Construct"])
+
+
+
+
