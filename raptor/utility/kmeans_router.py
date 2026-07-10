@@ -18,7 +18,7 @@ import random
 import math
 from fastapi import APIRouter, HTTPException, Depends, Body
 
-from raptor_auth import get_current_user, deduct_credit, supabase
+from .raptor_auth import get_current_user, deduct_credit, supabase
 
 router = APIRouter()
 
