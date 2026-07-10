@@ -1,4 +1,26 @@
 fastapi
-uvicorn
-dnspython
+uvicorn[standard]
+python-multipart
 supabase
+
+# raptor_router.py — email verification
+dnspython
+
+# crm/automations_router.py — webhook action calls out via requests
+requests
+
+# chronos_router.py — timezone-aware send scheduling
+httpx
+timezonefinder
+
+# vad_router.py — server-side batch VAD (the client-side WASM path has no
+# server dependency; this is only needed for /process-batch)
+webrtcvad
+
+# video_router.py — /verify-scrub shells out to the `ffprobe` binary via
+# subprocess. That's a system package, NOT installable via pip:
+#   Render / most Debian-based hosts: apt-get install -y ffmpeg
+#   Add this as a build-time step (e.g. a Render "native environment" /
+#   Dockerfile RUN apt-get install) — if ffprobe isn't on PATH, that route
+#   returns a clean 500 rather than crashing, but the tool won't work
+#   until it's installed.
