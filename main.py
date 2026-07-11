@@ -77,6 +77,12 @@ app.include_router(video_router, prefix="/api/raptor/video", tags=["Raptor - Vid
 # normal user-facing tool -- it's guarded by X-Automation-Secret (see
 # AUTOMATION_CRON_SECRET in raptor/crm/automations_router.py), not a user
 # JWT, so it deliberately sits outside the get_current_user/deduct_credit
-# pattern the other routers use. Point your scheduler (cron job, Render
-# Cron Job, GitHub Actions schedule, etc.) at POST /api/raptor/crm/run.
-app.include_router(automations_router, prefix="/api/raptor/crm", tags=["Raptor - CRM Automations"])
+# pattern the other routers use.
+#
+# Mounted at /api/automations (top-level, NOT /api/raptor/automations) to
+# match the setup instructions already written into crm/index.html's
+# developer-setup comment block -- that comment is what you (or anyone
+# else on this project) will actually read when wiring the cron job, so
+# the backend matches it rather than the other way around.
+# Point your scheduler at POST /api/automations/run.
+app.include_router(automations_router, prefix="/api/automations", tags=["Raptor - CRM Automations"])
