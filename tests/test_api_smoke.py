@@ -31,7 +31,7 @@ PUBLIC_STATUS_ENDPOINTS = [
     "/api/raptor/threader/status",
     "/api/raptor/vad/status",
     "/api/raptor/video/status",
-    "/api/raptor/crm/status",
+    "/api/automations/status",
 ]
 
 
@@ -92,17 +92,17 @@ def test_protected_endpoints_reject_unauthenticated_requests(method, path, body)
 
 # ── CRM automation engine: shared-secret protected, not JWT ────────────
 def test_crm_run_rejects_missing_secret():
-    resp = client.post("/api/raptor/crm/run")
+    resp = client.post("/api/automations/run")
     assert resp.status_code == 401
 
 
 def test_crm_run_rejects_wrong_secret():
-    resp = client.post("/api/raptor/crm/run", headers={"X-Automation-Secret": "definitely-wrong"})
+    resp = client.post("/api/automations/run", headers={"X-Automation-Secret": "definitely-wrong"})
     assert resp.status_code == 401
 
 
 def test_crm_run_now_rejects_missing_secret():
-    resp = client.post("/api/raptor/crm/some-automation-id/run-now")
+    resp = client.post("/api/automations/some-automation-id/run-now")
     assert resp.status_code == 401
 
 
