@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Depends, Body
 import httpx
 
-from raptor_auth import get_current_user, deduct_credit, supabase
+from .raptor_auth import get_current_user, deduct_credit, supabase
 
 router = APIRouter()
 

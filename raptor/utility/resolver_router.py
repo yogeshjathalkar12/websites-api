@@ -20,7 +20,7 @@ from functools import lru_cache
 from time import time
 from fastapi import APIRouter, HTTPException, Depends, Body, Request
 
-from raptor_auth import get_current_user, deduct_credit, supabase
+from .raptor_auth import get_current_user, deduct_credit, supabase
 
 router = APIRouter()
 
