@@ -16,7 +16,7 @@ from raptor.utility.threader_router import router as threader_router
 from raptor.utility.vad_router import router as vad_router
 from raptor.utility.video_router import router as video_router
 from raptor.crm.automations_router import router as automations_router
-from billing_router import router as billing_router
+from raptor.billing_router import router as billing_router
 
 # Initialize the main API hub
 app = FastAPI(title="Websites Central API")
