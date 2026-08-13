@@ -1,4 +1,9 @@
 """
+
+---------------------------------------------------------------------------------------------
+just tells the right time in different gelocations  but does not send emails 
+----------------------------------------------------------------------------------------------
+
 chronos_router.py — Tool 5: Chronos Timezone Optimization Engine
 
 Pipeline: raw city text -> lat/lng (geocoding) -> timezone polygon lookup

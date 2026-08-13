@@ -149,6 +149,47 @@ def scan_threads(payload: dict = Body(...), user_id: str = Depends(get_current_u
         n for n in nodes.values() if n["parent_id"] and not n["is_bot"]
     ]
 
+    # --- Attribute human replies back to the specific outreach_queue row
+    # that caused them, via the parent_id (In-Reply-To/References) matching
+    # a message_id mailer_router.py stored at send time. This is the join
+    # insights_router.py needs to say anything real about variant-level
+    # reply rates — without it, "Variant B performs better" is a guess.
+    attributed_count = 0
+    if supabase and human_reply_threads:
+        parent_ids = list({n["parent_id"] for n in human_reply_threads if n["parent_id"]})
+        # Chunk to stay well under typical URL/query length limits on a big scan
+        matched_rows = {}
+        for i in range(0, len(parent_ids), 200):
+            chunk = parent_ids[i:i + 200]
+            resp = (
+                supabase.table("outreach_queue")
+                .select("id, message_id, campaign_id, variant_hash")
+                .in_("message_id", chunk)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            for row in resp.data or []:
+                matched_rows[row["message_id"]] = row
+
+        events = []
+        for n in human_reply_threads:
+            matched = matched_rows.get(n["parent_id"])
+            if matched:
+                attributed_count += 1
+                events.append({
+                    "user_id": user_id,
+                    "outreach_queue_id": matched["id"],
+                    "event_type": "replied",
+                    "source_message_id": n["message_id"],
+                })
+        if events:
+            try:
+                supabase.table("email_events").upsert(
+                    events, on_conflict="outreach_queue_id,source_message_id"
+                ).execute()
+            except Exception:
+                pass
+
     if supabase:
         try:
             supabase.table("threader_scans").insert({
@@ -167,6 +208,7 @@ def scan_threads(payload: dict = Body(...), user_id: str = Depends(get_current_u
         "nodes": nodes,
         "human_replies": len(human_reply_threads),
         "bot_replies": sum(1 for n in nodes.values() if n["is_bot"]),
+        "replies_attributed_to_campaigns": attributed_count,
         "credits_left": remaining_credits,
     }
 

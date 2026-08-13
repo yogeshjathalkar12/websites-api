@@ -16,6 +16,7 @@ from raptor.utility.threader_router import router as threader_router
 from raptor.utility.vad_router import router as vad_router
 from raptor.utility.video_router import router as video_router
 from raptor.crm.automations_router import router as automations_router
+from billing_router import router as billing_router
 
 # Initialize the main API hub
 app = FastAPI(title="Websites Central API")
@@ -86,3 +87,10 @@ app.include_router(video_router, prefix="/api/raptor/video", tags=["Raptor - Vid
 # the backend matches it rather than the other way around.
 # Point your scheduler at POST /api/automations/run.
 app.include_router(automations_router, prefix="/api/automations", tags=["Raptor - CRM Automations"])
+
+# billing_router.py -- Razorpay Standard Checkout (create-order / verify-payment).
+# Mounted at /api/billing, matching every other tool's /api/<name> pattern.
+# Uses the same get_current_user JWT auth as the raptor tool routers.
+# Needs RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET set in Render's Environment
+# tab -- without them, /api/billing/status will report "not_configured".
+app.include_router(billing_router, prefix="/api/billing", tags=["Billing"])
