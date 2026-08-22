@@ -1,24 +1,26 @@
 """
 kmeans_router.py — Tool 7: K-Means ICP Clustering Engine
 
-The primary implementation runs in-browser (pure JS, no server round-trip
-needed for a CSV of a few hundred customers). This backend exists for the
-case the architecture doc doesn't cover: a CSV too large to comfortably
-crunch on the client's main thread, or a user who wants clustering run
-server-side so results persist and can be re-fetched from any device.
-
 Real k-means, not a stub: Z-score normalization per numeric field,
 k-means++ centroid seeding (better than pure-random -- avoids bad
 convergence on unlucky initial draws), Euclidean distance assignment,
 centroid recomputation, repeated to convergence or a max-iteration cap.
 Pure Python (no numpy dependency) so it runs anywhere this FastAPI app runs.
+
+BACKGROUND JOB PATTERN: the clustering loop itself (potentially hundreds of
+iterations over up to 5000 rows) now runs via BackgroundTasks instead of
+inline in the request -- see compute_jobs.py's docstring for exactly what
+this does and doesn't fix. POST /cluster validates input, deducts the
+credit, and returns a job_id immediately; GET /job/{job_id} polls for the
+result, same shape as the AI Content Suite's video pipeline polling.
 """
 
 import random
 import math
-from fastapi import APIRouter, HTTPException, Depends, Body
+from fastapi import APIRouter, HTTPException, Depends, Body, BackgroundTasks
 
 from .raptor_auth import get_current_user, deduct_credit, supabase
+from . import compute_jobs
 
 router = APIRouter()
 
@@ -89,13 +91,60 @@ def _run_kmeans(points: list, k: int, seed: int = 42):
     return assignments, centroids
 
 
+def _execute_cluster_job(job_id: str, user_id: str, rows: list, fields: list, k: int, label_field: str | None):
+    """Runs off the request thread via BackgroundTasks. Any failure is caught
+    and recorded on the job row rather than raised -- there's no request left
+    to raise it to by the time this runs."""
+    compute_jobs.mark_running(job_id)
+    try:
+        normalized_points, means, stds = _zscore_normalize(rows, fields)
+        assignments, centroids = _run_kmeans(normalized_points, k)
+
+        clusters = {i: [] for i in range(k)}
+        for row, cluster_idx in zip(rows, assignments):
+            entry = {"row": row}
+            if label_field and label_field in row:
+                entry["label"] = row[label_field]
+            clusters[cluster_idx].append(entry)
+
+        denorm_centroids = []
+        for c in centroids:
+            denorm_centroids.append({f: round(c[i] * stds[f] + means[f], 2) for i, f in enumerate(fields)})
+
+        cluster_summary = [
+            {
+                "cluster_id": i,
+                "size": len(clusters[i]),
+                "centroid": denorm_centroids[i],
+                "members": clusters[i],
+            }
+            for i in range(k)
+        ]
+
+        if supabase:
+            try:
+                supabase.table("icp_clusters").insert({
+                    "user_id": user_id,
+                    "k": k,
+                    "fields": fields,
+                    "row_count": len(rows),
+                    "result": cluster_summary,
+                }).execute()
+            except Exception:
+                pass
+
+        compute_jobs.mark_done(job_id, {"clusters": cluster_summary})
+    except Exception as e:
+        compute_jobs.mark_failed(job_id, str(e))
+
+
 @router.get("/status")
 def status():
     return {"tool": "kmeans-icp-clustering", "status": "operational"}
 
 
 @router.post("/cluster")
-def cluster(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
+def cluster(background_tasks: BackgroundTasks, payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """
     Body: {
       "rows": [{"company": "Acme", "revenue": 4200000, "employees": 80, ...}, ...],
@@ -103,6 +152,9 @@ def cluster(payload: dict = Body(...), user_id: str = Depends(get_current_user))
       "k": 3,
       "label_field": "company"              # optional, for readable output
     }
+    Returns {"job_id": ..., "status": "queued"} immediately. Poll
+    GET /job/{job_id} for the result -- see kmeans's own history via
+    /history once done, same as before.
     """
     rows = payload.get("rows") or []
     fields = payload.get("fields") or []
@@ -121,47 +173,20 @@ def cluster(payload: dict = Body(...), user_id: str = Depends(get_current_user))
             if f not in r or not isinstance(r[f], (int, float)):
                 raise HTTPException(status_code=400, detail=f"Row missing numeric field '{f}': {r}")
 
+    # Credit is deducted up front, synchronously -- the user shouldn't be
+    # able to queue free jobs by walking away before a background task
+    # would otherwise have deducted it.
     remaining_credits = deduct_credit(user_id)
 
-    normalized_points, means, stds = _zscore_normalize(rows, fields)
-    assignments, centroids = _run_kmeans(normalized_points, k)
+    job_id = compute_jobs.create_job(user_id, "kmeans", {"row_count": len(rows), "fields": fields, "k": k})
+    background_tasks.add_task(_execute_cluster_job, job_id, user_id, rows, fields, k, label_field)
 
-    clusters = {i: [] for i in range(k)}
-    for row, cluster_idx in zip(rows, assignments):
-        entry = {"row": row}
-        if label_field and label_field in row:
-            entry["label"] = row[label_field]
-        clusters[cluster_idx].append(entry)
+    return {"job_id": job_id, "status": "queued", "credits_left": remaining_credits}
 
-    # De-normalize centroids back into real units so the UI can show
-    # "Cluster 2: avg revenue $4.1M, avg employees 62" instead of Z-scores.
-    denorm_centroids = []
-    for c in centroids:
-        denorm_centroids.append({f: round(c[i] * stds[f] + means[f], 2) for i, f in enumerate(fields)})
 
-    cluster_summary = [
-        {
-            "cluster_id": i,
-            "size": len(clusters[i]),
-            "centroid": denorm_centroids[i],
-            "members": clusters[i],
-        }
-        for i in range(k)
-    ]
-
-    if supabase:
-        try:
-            supabase.table("icp_clusters").insert({
-                "user_id": user_id,
-                "k": k,
-                "fields": fields,
-                "row_count": len(rows),
-                "result": cluster_summary,
-            }).execute()
-        except Exception:
-            pass
-
-    return {"clusters": cluster_summary, "credits_left": remaining_credits}
+@router.get("/job/{job_id}")
+def get_job(job_id: str, user_id: str = Depends(get_current_user)):
+    return compute_jobs.get_job(user_id, job_id)
 
 
 @router.get("/history")
