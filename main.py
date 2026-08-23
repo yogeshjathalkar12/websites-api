@@ -2,10 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- 1. IMPORT YOUR VENTURES ---
-# raptor_router.py is the original venture entry point (verify-email,
-# tracker pixel, campaign-opens). Everything under raptor/utility/ is the
-# set of 8 heavy-compute tools that were sitting in the repo unwired --
-# each one is now imported and mounted below.
+# raptor.utility/ is the set of heavy-compute tools (8 original + the AI
+# Content Suite added after) -- each imported and mounted below.
 from raptor.raptor_router import router as raptor_router
 from raptor.utility.chronos_router import router as chronos_router
 from raptor.utility.kmeans_router import router as kmeans_router
@@ -15,6 +13,9 @@ from raptor.utility.spintax_router import router as spintax_router
 from raptor.utility.threader_router import router as threader_router
 from raptor.utility.vad_router import router as vad_router
 from raptor.utility.video_router import router as video_router
+from raptor.ai_integration.content_router import router as content_router
+from raptor.email.router import router as email_router
+from raptor.whatsapp.router import router as whatsapp_router
 from raptor.crm.automations_router import router as automations_router
 from raptor.billing_router import router as billing_router
 
@@ -73,6 +74,9 @@ app.include_router(spintax_router, prefix="/api/raptor/spintax", tags=["Raptor -
 app.include_router(threader_router, prefix="/api/raptor/threader", tags=["Raptor - IMAP Threader"])
 app.include_router(vad_router, prefix="/api/raptor/vad", tags=["Raptor - Call VAD"])
 app.include_router(video_router, prefix="/api/raptor/video", tags=["Raptor - Video Compressor"])
+app.include_router(content_router, prefix="/api/raptor/content", tags=["Raptor - AI Content Suite"])
+app.include_router(email_router, prefix="/api/raptor/email", tags=["Raptor - Email Automation"])
+app.include_router(whatsapp_router, prefix="/api/raptor/whatsapp", tags=["Raptor - WhatsApp Automation"])
 
 # crm/automations_router.py is a cron-driven background worker, not a
 # normal user-facing tool -- it's guarded by X-Automation-Secret (see
@@ -86,6 +90,13 @@ app.include_router(video_router, prefix="/api/raptor/video", tags=["Raptor - Vid
 # else on this project) will actually read when wiring the cron job, so
 # the backend matches it rather than the other way around.
 # Point your scheduler at POST /api/automations/run.
+#
+# Two more cron-only endpoints now share this same X-Automation-Secret
+# pattern and need the same scheduler hitting them every 1-3 minutes —
+# this is what actually paces email/WhatsApp sends over time, since both
+# routers process one small batch per call rather than blocking a thread:
+#   POST /api/raptor/email/tick
+#   POST /api/raptor/whatsapp/tick
 app.include_router(automations_router, prefix="/api/automations", tags=["Raptor - CRM Automations"])
 
 # billing_router.py -- Razorpay Standard Checkout (create-order / verify-payment).
