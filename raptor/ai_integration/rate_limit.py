@@ -19,7 +19,7 @@ product-tier paywall. Tighten via MODALITY_LIMITS if real usage says otherwise.
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 
-from .raptor_auth import supabase
+from raptor.utility.raptor_auth import supabase
 
 # (max generations, window in minutes) per modality per user.
 MODALITY_LIMITS = {
