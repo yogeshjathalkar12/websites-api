@@ -20,6 +20,37 @@ three different SDKs with three different conventions.
 import base64
 import httpx
 
+
+# ---------------------------------------------------------------------------
+# File attachments — a step (or a /draft call) can carry arbitrary files.
+# We only actually know what to do with two kinds: images (sent as real
+# multimodal content blocks, provider-native format) and plain text (decoded
+# and inlined into the prompt as context, since not every provider's text
+# endpoint takes a generic "file" block the same way). Anything else
+# (PDF, docx, etc.) is refused loudly rather than silently ignored or
+# base64-dumped into a prompt where it'd just be noise tokens.
+# ---------------------------------------------------------------------------
+
+def _split_attachments(attachments):
+    images, text_bits = [], []
+    for f in attachments or []:
+        media_type = (f.get("media_type") or "").lower()
+        name = f.get("filename", "file")
+        if media_type.startswith("image/"):
+            images.append(f)
+        elif media_type.startswith("text/") or media_type in ("application/json",):
+            try:
+                decoded = base64.b64decode(f["data_base64"]).decode("utf-8", errors="replace")
+            except Exception:
+                raise ProviderError(f"Could not read attached file '{name}'.")
+            text_bits.append(f"--- {name} ---\n{decoded}")
+        else:
+            raise ProviderError(
+                f"'{name}' is a {media_type or 'unknown'} file — only images and plain-text "
+                "files are supported as attachments right now."
+            )
+    return images, text_bits
+
 # ---------------------------------------------------------------------------
 # Capability registry
 # ---------------------------------------------------------------------------
@@ -94,18 +125,34 @@ def validate_key(provider: str, api_key: str) -> dict:
 # Text generation
 # ---------------------------------------------------------------------------
 
-def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: int = 1024) -> str:
+def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: int = 1024, attachments: list = None) -> str:
+    images, text_bits = _split_attachments(attachments)
+    if text_bits:
+        prompt = prompt + "\n\n" + "\n\n".join(text_bits)
+
     if provider == "openai":
+        content = prompt
+        if images:
+            content = [{"type": "text", "text": prompt}] + [
+                {"type": "image_url", "image_url": {"url": f"data:{img['media_type']};base64,{img['data_base64']}"}}
+                for img in images
+            ]
         resp = httpx.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
+            json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens},
             timeout=60,
         )
         _raise_for_provider_error(resp, "openai")
         return resp.json()["choices"][0]["message"]["content"]
 
     if provider == "anthropic":
+        content = prompt
+        if images:
+            content = [{"type": "text", "text": prompt}] + [
+                {"type": "image", "source": {"type": "base64", "media_type": img["media_type"], "data": img["data_base64"]}}
+                for img in images
+            ]
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -113,7 +160,7 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content}]},
             timeout=60,
         )
         _raise_for_provider_error(resp, "anthropic")
@@ -121,10 +168,13 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
         return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 
     if provider == "google":
+        parts = [{"text": prompt}]
+        for img in images:
+            parts.append({"inline_data": {"mime_type": img["media_type"], "data": img["data_base64"]}})
         resp = httpx.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             params={"key": api_key},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
+            json={"contents": [{"parts": parts}]},
             timeout=60,
         )
         _raise_for_provider_error(resp, "google")

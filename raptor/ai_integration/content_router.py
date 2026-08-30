@@ -33,6 +33,8 @@ any step in the pipeline runs — see that module's docstring for why this
 exists even though the user pays for generation on their own key.
 """
 
+import concurrent.futures
+
 from fastapi import APIRouter, HTTPException, Depends, Body
 
 from raptor.utility.raptor_auth import get_current_user, supabase
@@ -114,6 +116,64 @@ def get_templates():
 
 
 # ---------------------------------------------------------------------------
+# Prompt drafting — bridges a free-typed "subject" (+ optional files) into
+# ONE detailed, generation-ready prompt. This is the step PROMPT_TEMPLATES
+# can't do on its own: templates need pre-named {variables}, but a user
+# typing "a launch post for our new espresso machine, aimed at cafe owners"
+# plus a product photo doesn't map onto {product}/{audience}/{tone} cleanly.
+# Drafting is a single text call; the resulting prompt is returned to the
+# user to review/edit, and is NOT persisted or auto-run — it only becomes a
+# pipeline step once the user submits it back via /pipeline as a custom step
+# (see _resolve_step below). Costs one text call on the user's own key.
+# ---------------------------------------------------------------------------
+
+@router.post("/draft")
+def draft_prompt(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
+    """
+    Body: {
+      "subject": "rough description of what the user wants",
+      "modality": "text" | "image" | "video",
+      "provider": "openai" | "google" | "anthropic",
+      "files": [{"filename": "...", "media_type": "image/png", "data_base64": "..."}]
+    }
+    Returns {"draft_prompt": "..."} for the user to approve or edit before
+    it's used as a custom pipeline step's "prompt".
+    """
+    subject = (payload.get("subject") or "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="Describe what you want before drafting a prompt.")
+
+    provider = payload.get("provider")
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'.")
+
+    modality = payload.get("modality", "text")
+    if modality not in ("text", "image", "video"):
+        raise HTTPException(status_code=400, detail=f"Unknown modality '{modality}'.")
+
+    model = PROVIDER_CAPABILITIES[provider]["text"]
+    if not model:
+        raise HTTPException(status_code=400, detail=f"'{provider}' has no text model to draft with.")
+
+    files = payload.get("files") or []
+    api_key = key_vault.get_decrypted_key(user_id, provider)
+
+    instruction = (
+        f"A user wants to generate {modality} content. Their rough request: \"{subject}\". "
+        "If any files are attached, use them for context (e.g. a reference image or brief). "
+        "Write exactly ONE detailed, specific, ready-to-use prompt for a generation model — "
+        "concrete, unambiguous, no placeholders, no meta-commentary, no preamble like 'Here is a prompt:'. "
+        "Output ONLY the prompt text itself."
+    )
+    try:
+        draft = call_text(provider, api_key, model, instruction, attachments=files)
+    except ProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {"draft_prompt": draft.strip(), "provider": provider, "modality": modality}
+
+
+# ---------------------------------------------------------------------------
 # Key management
 # ---------------------------------------------------------------------------
 
@@ -152,19 +212,78 @@ def _render(template: str, variables: dict, previous_output: str) -> str:
         raise HTTPException(status_code=400, detail=f"Missing variable {e} for this template.")
 
 
+def _resolve_step(step: dict, previous_output: str):
+    """
+    A step is either template-based (existing behavior — template_id +
+    variables) or custom (a user-approved/edited prompt from /draft, carried
+    as step["prompt"] + step["modality"]). Either kind can list multiple
+    providers under "providers" instead of a single "provider" — that's the
+    multi-agent collaboration case, where the same exact prompt is fanned
+    out to every listed provider in the same step.
+    Returns (modality, prompt, providers: list[str]).
+    """
+    providers = step.get("providers") or ([step["provider"]] if step.get("provider") else [])
+    if not providers:
+        raise HTTPException(status_code=400, detail="Step needs at least one provider.")
+    for p in providers:
+        if p not in SUPPORTED_PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"Unsupported provider '{p}'.")
+
+    if step.get("prompt"):
+        modality = step.get("modality")
+        if modality not in ("text", "image", "video"):
+            raise HTTPException(status_code=400, detail="Custom step needs a valid 'modality'.")
+        return modality, step["prompt"], providers
+
+    template_id = step.get("template_id")
+    if template_id not in PROMPT_TEMPLATES:
+        raise HTTPException(status_code=400, detail=f"Unknown template '{template_id}'.")
+    tpl = PROMPT_TEMPLATES[template_id]
+    prompt = _render(tpl["template"], step.get("variables"), previous_output)
+    return tpl["modality"], prompt, providers
+
+
+def _run_agents(modality: str, prompt: str, providers: list, api_keys: dict) -> dict:
+    """Run the SAME prompt across multiple providers concurrently — the
+    'agents collaborating at the same time' case. Each provider's output
+    comes back independently; nothing here merges or ranks them, that's
+    left to the user (or a later template/custom step that reads
+    previous_output, which for a multi-agent step is a labeled join of
+    every agent's output — see run_pipeline below)."""
+
+    def _one(provider):
+        api_key = api_keys[provider]
+        model = PROVIDER_CAPABILITIES[provider][modality]
+        if modality == "text":
+            return provider, call_text(provider, api_key, model, prompt)
+        if modality == "image":
+            return provider, call_image(provider, api_key, model, prompt)
+        raise ProviderError("Unreachable modality in agent fan-out.")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(providers))) as ex:
+        return dict(ex.map(_one, providers))
+
+
 @router.post("/pipeline")
 def run_pipeline(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """
     Body: {
-      "content_type": "post" | "email" | "flyer" | "video" | "chain",
+      "content_type": "post" | "email" | "flyer" | "video" | "chain" | "custom",
       "steps": [
-        {"provider": "openai", "template_id": "post_linkedin", "variables": {"product": "...", "audience": "...", "tone": "punchy"}},
-        {"provider": "anthropic", "template_id": "refine_generic", "variables": {}}
+        # template-based (unchanged):
+        {"provider": "openai", "template_id": "post_linkedin", "variables": {...}},
+        # custom, single agent — "prompt" comes from an approved/edited /draft result:
+        {"provider": "anthropic", "prompt": "Write a ...", "modality": "text"},
+        # custom, multi-agent — SAME prompt run concurrently on every listed provider:
+        {"providers": ["openai", "anthropic", "google"], "prompt": "Write a ...", "modality": "text"}
       ]
     }
-    Text/image steps run inline. If the LAST step's template is a video
-    template, the pipeline returns status "running" with a job reference —
-    poll GET /pipeline/{id} until status is "done" or "failed".
+    Text/image steps run inline. A multi-provider step fans the identical
+    prompt out to every listed provider at once and returns one result per
+    provider. If the LAST step resolves to modality "video", the pipeline
+    returns status "running" with a job reference — poll GET /pipeline/{id}
+    until status is "done" or "failed". Video steps stay single-provider
+    (async job pattern doesn't fan out the way sync text/image calls do).
     """
     steps = payload.get("steps") or []
     if not steps:
@@ -172,56 +291,62 @@ def run_pipeline(payload: dict = Body(...), user_id: str = Depends(get_current_u
     if len(steps) > MAX_STEPS:
         raise HTTPException(status_code=400, detail=f"Max {MAX_STEPS} chained steps per pipeline.")
 
-    for i, step in enumerate(steps):
-        provider = step.get("provider")
-        template_id = step.get("template_id")
-        if provider not in SUPPORTED_PROVIDERS:
-            raise HTTPException(status_code=400, detail=f"Step {i}: unsupported provider '{provider}'.")
-        if template_id not in PROMPT_TEMPLATES:
-            raise HTTPException(status_code=400, detail=f"Step {i}: unknown template '{template_id}'.")
-        modality = PROMPT_TEMPLATES[template_id]["modality"]
-        if modality == "video" and i != len(steps) - 1:
-            raise HTTPException(status_code=400, detail="A video step can only be the last step in a pipeline.")
-        if not PROVIDER_CAPABILITIES[provider][modality]:
-            raise HTTPException(status_code=400, detail=f"Step {i}: '{provider}' does not support {modality} generation.")
+    # First pass: resolve every step's (modality, prompt, providers) up
+    # front so we can validate positioning/capability/rate-limits before
+    # spending a single API call.
+    resolved = [_resolve_step(step, "") for step in steps]  # prompt text for template steps re-resolved per-step below with real previous_output; this pass is capability/shape validation only
+    for i, (modality, _prompt, providers) in enumerate(resolved):
+        if modality == "video":
+            if i != len(steps) - 1:
+                raise HTTPException(status_code=400, detail="A video step can only be the last step in a pipeline.")
+            if len(providers) != 1:
+                raise HTTPException(status_code=400, detail="A video step can only use a single provider.")
+        for p in providers:
+            if not PROVIDER_CAPABILITIES[p][modality]:
+                raise HTTPException(status_code=400, detail=f"Step {i}: '{p}' does not support {modality} generation.")
 
     # Rate-limit check happens once, up front, for every costly modality this
-    # pipeline touches — so a 5-step chain with an image step fails fast
+    # pipeline touches — so a multi-step chain with an image step fails fast
     # before burning the earlier text steps' API calls.
-    pipeline_modalities = sorted({PROMPT_TEMPLATES[s["template_id"]]["modality"] for s in steps})
+    pipeline_modalities = sorted({m for m, _p, _pr in resolved})
     for modality in pipeline_modalities:
         check_rate_limit(user_id, modality)
 
     previous_output = ""
     step_results = []
+    is_video_last = resolved[-1][0] == "video"
 
     try:
-        for step in steps[:-1] if PROMPT_TEMPLATES[steps[-1]["template_id"]]["modality"] == "video" else steps:
-            provider = step["provider"]
-            tpl = PROMPT_TEMPLATES[step["template_id"]]
-            api_key = key_vault.get_decrypted_key(user_id, provider)
-            prompt = _render(tpl["template"], step.get("variables"), previous_output)
-            model = PROVIDER_CAPABILITIES[provider][tpl["modality"]]
+        for step in (steps[:-1] if is_video_last else steps):
+            modality, prompt, providers = _resolve_step(step, previous_output)
+            template_id = step.get("template_id", "custom")
 
-            if tpl["modality"] == "text":
-                output = call_text(provider, api_key, model, prompt)
-            elif tpl["modality"] == "image":
-                output = call_image(provider, api_key, model, prompt)
+            if len(providers) == 1:
+                provider = providers[0]
+                api_key = key_vault.get_decrypted_key(user_id, provider)
+                model = PROVIDER_CAPABILITIES[provider][modality]
+                if modality == "text":
+                    output = call_text(provider, api_key, model, prompt)
+                elif modality == "image":
+                    output = call_image(provider, api_key, model, prompt)
+                else:
+                    raise HTTPException(status_code=400, detail="Unreachable modality in sync branch.")
+                step_results.append({"provider": provider, "template_id": template_id, "modality": modality, "output": output})
+                previous_output = output if modality == "text" else previous_output
             else:
-                raise HTTPException(status_code=400, detail="Unreachable modality in sync branch.")
+                api_keys = {p: key_vault.get_decrypted_key(user_id, p) for p in providers}
+                outputs = _run_agents(modality, prompt, providers, api_keys)
+                for p in providers:
+                    step_results.append({"provider": p, "template_id": template_id, "modality": modality, "output": outputs[p]})
+                if modality == "text":
+                    previous_output = "\n\n".join(f"[{p}]\n{outputs[p]}" for p in providers)
 
-            step_results.append({"provider": provider, "template_id": step["template_id"], "modality": tpl["modality"], "output": output})
-            previous_output = output if tpl["modality"] == "text" else previous_output
-
-        last_step = steps[-1]
-        last_tpl = PROMPT_TEMPLATES[last_step["template_id"]]
-
-        if last_tpl["modality"] == "video":
-            provider = last_step["provider"]
+        if is_video_last:
+            last_modality, last_prompt, last_providers = _resolve_step(steps[-1], previous_output)
+            provider = last_providers[0]
             api_key = key_vault.get_decrypted_key(user_id, provider)
-            prompt = _render(last_tpl["template"], last_step.get("variables"), previous_output)
             model = PROVIDER_CAPABILITIES[provider]["video"]
-            job_id = start_video_job(provider, api_key, model, prompt)
+            job_id = start_video_job(provider, api_key, model, last_prompt)
 
             row = {
                 "user_id": user_id,
