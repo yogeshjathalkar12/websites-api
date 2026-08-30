@@ -27,3 +27,4 @@ webrtcvad
 
 razorpay
 cryptography
+resend
