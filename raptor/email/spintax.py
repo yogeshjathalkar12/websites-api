@@ -32,19 +32,25 @@ def render_spintax(text: str) -> str:
         text = new_text
 
 
-def render_merge_fields(text: str, contact: dict, unsubscribe_url: str) -> str:
+def render_merge_fields(text: str, contact: dict, unsubscribe_url: str, extra_fields: dict | None = None) -> str:
     replacements = {
         '{{first_name}}': contact.get('first_name') or 'there',
         '{{last_name}}': contact.get('last_name') or '',
         '{{company}}': contact.get('company') or '',
         '{{unsubscribe_url}}': unsubscribe_url,
     }
+    # extra_fields carries a trigger event's payload (order_total,
+    # checkout_url, etc.) — campaign sends never pass this, so it's an
+    # optional add-on rather than a change to existing behavior.
+    if extra_fields:
+        for key, value in extra_fields.items():
+            replacements[f'{{{{{key}}}}}'] = '' if value is None else str(value)
     for key, value in replacements.items():
         text = text.replace(key, value)
     return text
 
 
-def render_email(template: str, contact: dict, unsubscribe_url: str) -> str:
+def render_email(template: str, contact: dict, unsubscribe_url: str, extra_fields: dict | None = None) -> str:
     """Spintax first, then merge fields — so merge fields never get consumed as spintax options."""
     spun = render_spintax(template)
-    return render_merge_fields(spun, contact, unsubscribe_url)
+    return render_merge_fields(spun, contact, unsubscribe_url, extra_fields)
