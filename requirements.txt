@@ -28,3 +28,8 @@ webrtcvad
 razorpay
 cryptography
 resend
+
+# raptor/email/security.py — verify_resend_webhook() checks the Svix
+# signature Resend puts on bounce/complaint webhook deliveries. Without
+# this installed, that webhook 500s on every call.
+svix

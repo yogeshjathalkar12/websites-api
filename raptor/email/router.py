@@ -50,6 +50,7 @@ from fastapi.responses import HTMLResponse, Response, RedirectResponse
 
 from raptor.utility.raptor_auth import get_current_user, supabase
 from . import key_vault
+from . import providers
 from . import tracking
 from . import triggers
 from . import event_sources
@@ -73,6 +74,10 @@ _PIXEL_GIF = bytes.fromhex(
 router = APIRouter()
 
 BATCH_SIZE = 3
+# After a provider says "limit reached", that account isn't tried again for this
+# long. Per-process memory is enough: at worst another worker tries once more.
+PROVIDER_BACKOFF_MINUTES = 15
+_provider_backoff_until: dict = {}
 LOCK_STALE_MINUTES = 2  # short — batches finish in seconds now, not minutes
 AUTOMATION_CRON_SECRET = os.environ.get('AUTOMATION_CRON_SECRET')  # same secret automations_router.py uses
 
@@ -147,6 +152,58 @@ def reputation_tick():
 # Accounts
 # ---------------------------------------------------------------------------
 
+# Starting volume and ramp target per kind of account. The ramp adds
+# WARMUP_DAILY_STEP per day from daily_cap up to warmup_target (warmup.py).
+#   resend/free  — Resend's Free plan stops at 100 emails a day, so the
+#                  target never goes above that.
+#   resend/paid  — no daily limit on Resend's side; 300/day is still a
+#                  sensible ceiling for a domain that is building a reputation.
+#   smtp         — a normal mailbox; 40/day is a safe level for one-to-one
+#                  outreach (Gmail and Microsoft cap and flag much lower than
+#                  their published limits when volume jumps).
+RESEND_FREE_DAILY_LIMIT = 100
+SENDING_DEFAULTS = {
+    ('resend', 'free'): {'daily_cap': 20, 'warmup_target': RESEND_FREE_DAILY_LIMIT},
+    ('resend', 'paid'): {'daily_cap': 20, 'warmup_target': 300},
+    ('smtp', 'free'): {'daily_cap': 10, 'warmup_target': 40},
+}
+
+
+SMTP_OFF_MESSAGE = ("Sending from your own mailbox isn't switched on for this server yet. "
+                    "Use Resend for now, or ask us when mailbox sending will be available.")
+
+
+def _sending_defaults(provider: str, plan: str) -> dict:
+    if provider == 'resend':
+        return SENDING_DEFAULTS[('resend', 'paid' if plan == 'paid' else 'free')]
+    return SENDING_DEFAULTS[('smtp', 'free')]
+
+
+@router.get("/providers")
+def available_providers(user_id: str = Depends(get_current_user)):
+    """Which ways of sending this server currently supports, so the setup
+    screen can hide the ones that aren't switched on."""
+    return {'resend': True, 'smtp': providers.smtp_enabled()}
+
+
+@router.post("/accounts/test-smtp")
+def test_smtp_connection(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
+    """Logs in to the customer's mail server and disconnects, without
+    sending anything, so the setup screen can say "connected" before the
+    account is saved. The password is used for this one call only."""
+    if not providers.smtp_enabled():
+        raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
+    password = str(payload.get('password', ''))
+    if not password:
+        raise HTTPException(status_code=400, detail="Enter the mailbox password.")
+    try:
+        config = providers.validate_smtp_config(payload.get('smtp_config') or {})
+        providers.SmtpProvider({**config, 'password': password}).check_connection()
+    except (ValueError, RuntimeError, providers.ProviderUnavailable) as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    return {'ok': True}
+
+
 @router.post("/accounts")
 def create_account(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     required = ['label', 'from_email', 'from_name', 'api_key']
@@ -154,14 +211,33 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required field(s): {', '.join(missing)}")
 
+    provider = payload.get('provider', 'resend')
+    if provider not in providers.SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Use one of: {', '.join(providers.SUPPORTED_PROVIDERS)}.")
+
+    smtp_config = None
+    if provider == 'smtp':
+        if not providers.smtp_enabled():
+            raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
+        try:
+            smtp_config = providers.validate_smtp_config(payload.get('smtp_config') or {})
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+
+    caps = _sending_defaults(provider, str(payload.get('plan', 'free')))
+
     row = {
         'owner_id': user_id,
         'label': payload['label'].strip(),
-        'provider': payload.get('provider', 'resend'),
+        'provider': provider,
         'from_email': payload['from_email'].strip(),
         'from_name': payload['from_name'].strip(),
+        # For SMTP this is the mailbox password. Only the non-secret
+        # settings (host/port/username/security) go in smtp_config.
         'encrypted_api_key': key_vault.encrypt_key(payload['api_key'].strip()),
-        'smtp_config': payload.get('smtp_config'),
+        'smtp_config': smtp_config,
+        'daily_cap': caps['daily_cap'],
+        'warmup_target': caps['warmup_target'],
         # Compared with hmac.compare_digest on inbound webhooks, never
         # decrypted — a plain random token is enough, no need for
         # key_vault here.
@@ -269,6 +345,10 @@ def _send_one_batch(campaign_id: str) -> dict:
         if not within_business_hours(account):
             return {'skipped': 'outside_business_hours'}
 
+        backoff_until = _provider_backoff_until.get(account['id'])
+        if backoff_until and datetime.now(timezone.utc) < backoff_until:
+            return {'skipped': 'provider_rate_limited', 'retry_after': backoff_until.isoformat()}
+
         allowed_today = todays_allowed_volume(account)
         sent_today = sent_today_count(account)
         remaining = allowed_today - sent_today
@@ -305,6 +385,7 @@ def _send_one_batch(campaign_id: str) -> dict:
         provider = sending.get_ready_provider(account)
 
         sent, failed, skipped = 0, 0, 0
+        rate_limited = False
         for recipient in recipients:
             contact = recipient['email_contacts']
             if contact['email'] in suppressed:
@@ -334,12 +415,23 @@ def _send_one_batch(campaign_id: str) -> dict:
                     'event_type': 'sent', 'provider_message_id': message_id,
                 }).execute()
                 sent += 1
+            except providers.ProviderRateLimited as err:
+                # The provider (or the mailbox) hit a sending limit. Nothing
+                # is wrong with this recipient, so leave them 'pending' and
+                # try again later instead of marking them failed for good.
+                _provider_backoff_until[account['id']] = datetime.now(timezone.utc) + timedelta(minutes=PROVIDER_BACKOFF_MINUTES)
+                rate_limited = True
+                print(f"Provider unavailable or at its limit for account {account['id']}; pausing sends: {err}")
+                break
             except Exception as err:
                 supabase.table('email_campaign_recipients').update({'status': 'failed'}).eq('id', recipient['id']).execute()
                 failed += 1
                 print(f"Failed to send to {contact['email']}: {err}")
 
-        return {'sent': sent, 'failed': failed, 'skipped_suppressed': skipped}
+        result = {'sent': sent, 'failed': failed, 'skipped_suppressed': skipped}
+        if rate_limited:
+            result['paused'] = 'provider_rate_limited'
+        return result
     finally:
         _release_lock(campaign_id)
 
