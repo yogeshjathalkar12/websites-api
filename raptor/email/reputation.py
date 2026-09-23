@@ -14,8 +14,7 @@ Two kinds of checks, deliberately run at different cadences:
 
 No new dependency for DNS: TXT lookups (SPF/DMARC/DKIM) go through
 Google's public DNS-over-HTTPS JSON API via stdlib urllib rather than
-adding a DNS library — this service already needs outbound HTTPS for
-the Resend API, so no new network requirement either. Blocklist
+adding a DNS library. Blocklist
 checking (Spamhaus DBL) is a plain A-record lookup, which stdlib socket
 already handles natively — resolves = listed, NXDOMAIN = not listed.
 
@@ -94,7 +93,8 @@ def _doh_txt_lookup(hostname: str) -> list:
     'a lookup couldn't confirm this record exists' anyway."""
     try:
         url = 'https://dns.google/resolve?' + urllib.parse.urlencode({'name': hostname, 'type': 'TXT'})
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        # nosec B310 - the URL is built above with a fixed https:// scheme and host
+        with urllib.request.urlopen(url, timeout=5) as resp:  # nosec B310
             data = json.loads(resp.read())
         answers = data.get('Answer') or []
         return [a['data'].strip('"') for a in answers if a.get('type') == 16]  # DNS type 16 = TXT
@@ -136,17 +136,12 @@ def check_domain_authentication(account: dict) -> dict:
         'detail': 'DMARC record found' if has_dmarc else f'No DMARC (v=DMARC1) TXT record found on _dmarc.{domain}',
     }
 
-    if account.get('provider') == 'resend':
-        dkim_records = _doh_txt_lookup(f"resend._domainkey.{domain}")
-        has_dkim = len(dkim_records) > 0
-        results['dkim'] = {
-            'status': 'ok' if has_dkim else 'warning',
-            'detail': 'DKIM record found' if has_dkim else f'No DKIM TXT record found at resend._domainkey.{domain} — check the DNS records Resend gave you when you added this domain',
-        }
-    else:
-        # No generic way to know a DKIM selector for an arbitrary SMTP
-        # provider — this only means anything for Resend today.
-        results['dkim'] = {'status': 'not_applicable', 'detail': 'DKIM check is only implemented for the Resend provider today'}
+    # A DKIM record lives under a selector that depends on the mail provider
+    # (Google, Microsoft and Zoho all differ), so there is no generic lookup.
+    results['dkim'] = {
+        'status': 'not_applicable',
+        'detail': "DKIM can't be checked automatically for your own mailbox. Check it in your mail provider's admin settings.",
+    }
 
     listed = _is_domain_blocklisted(domain)
     if listed is None:

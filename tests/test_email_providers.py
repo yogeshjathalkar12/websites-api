@@ -2,8 +2,8 @@
 tests/test_email_providers.py — the email module's provider layer.
 
 Covers the SMTP provider (settings validation, TLS, message shape, error
-classification), the Resend provider (rate-limit mapping and the
-cross-customer API-key race), account creation defaults, and the send
+classification), account creation (defaults, the responsibilities
+confirmation and its stored proof), and the send
 loop's "provider limit reached -> pause, don't fail" behaviour.
 
 No real network, mail server or database is used: smtplib, DNS and the
@@ -25,8 +25,6 @@ os.environ.setdefault('EMAIL_KEY_ENCRYPTION_SECRET', Fernet.generate_key().decod
 os.environ.setdefault('UNSUBSCRIBE_SIGNING_SECRET', 'u' * 40)
 os.environ.setdefault('EMAIL_TRACKING_SIGNING_SECRET', 't' * 40)
 os.environ.setdefault('APP_BASE_URL', 'https://example.test')
-
-import resend  # noqa: E402
 
 from raptor.email import providers, key_vault  # noqa: E402
 from raptor.email import router as email_router  # noqa: E402
@@ -265,67 +263,16 @@ def test_smtp_needs_every_setting():
         providers.SmtpProvider({'host': 'a.b', 'port': 587, 'username': 'u', 'security': 'starttls'})
 
 
-# ───────────────────────── ResendProvider ─────────────────────────
-
-def test_resend_success_returns_the_id(monkeypatch):
-    monkeypatch.setattr(resend.Emails, 'send', staticmethod(lambda payload: {'id': 'abc123'}))
-    assert providers.ResendProvider('re_key').send('a@b.co', 'A', 'c@d.co', 'S', '<p>x</p>') == 'abc123'
-
-
-@pytest.mark.parametrize('make', [
-    lambda: resend.exceptions.RateLimitError(message='Too many', error_type='rate_limit_exceeded', code=429),
-    lambda: resend.exceptions.RateLimitError(message='Daily quota', error_type='daily_quota_exceeded', code=429),
-    lambda: resend.exceptions.ResendError(code=429, error_type='monthly_quota_exceeded', message='m', suggested_action='s'),
-])
-def test_resend_limits_become_rate_limited(monkeypatch, make):
-    def raiser(payload):
-        raise make()
-    monkeypatch.setattr(resend.Emails, 'send', staticmethod(raiser))
-    with pytest.raises(providers.ProviderRateLimited):
-        providers.ResendProvider('re_key').send('a@b.co', 'A', 'c@d.co', 'S', '<p>x</p>')
-
-
-def test_other_resend_errors_are_not_treated_as_limits(monkeypatch):
-    def raiser(payload):
-        raise resend.exceptions.ResendError(code=403, error_type='invalid_api_key', message='bad key', suggested_action='fix')
-    monkeypatch.setattr(resend.Emails, 'send', staticmethod(raiser))
-    with pytest.raises(resend.exceptions.ResendError):
-        providers.ResendProvider('re_key').send('a@b.co', 'A', 'c@d.co', 'S', '<p>x</p>')
-
-
-def test_concurrent_sends_never_use_another_customers_key(monkeypatch):
-    """Regression: the Resend SDK holds the key in a module global, so two
-    threads sending for two customers could cross keys."""
-    seen = []
-
-    def slow_send(payload):
-        key_at_call = resend.api_key
-        time.sleep(0.005)  # let other threads run between setting the key and using it
-        seen.append((payload['to'][0], key_at_call, resend.api_key))
-        return {'id': 'x'}
-    monkeypatch.setattr(resend.Emails, 'send', staticmethod(slow_send))
-
-    def worker(i):
-        key = f're_customer_{i % 2}'
-        providers.ResendProvider(key).send('a@b.co', 'A', f'{i % 2}@d.co', 'S', '<p>x</p>')
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(24)]
-    [t.start() for t in threads]
-    [t.join() for t in threads]
-    assert len(seen) == 24
-    for to, key_at_call, key_after in seen:
-        assert key_at_call == f're_customer_{to[0]}' and key_after == key_at_call
-
-
 # ───────────────────────── get_provider ─────────────────────────
 
-def test_get_provider_builds_each_kind():
-    assert isinstance(providers.get_provider({'provider': 'resend', 'api_key': 'k'}), providers.ResendProvider)
+def test_get_provider_builds_a_mailbox_and_rejects_anything_else():
     smtp = providers.get_provider({'provider': 'smtp', 'api_key': 'pw', 'smtp_config': {
         'host': 'smtp.example.com', 'port': 587, 'username': 'u', 'security': 'starttls'}})
     assert isinstance(smtp, providers.SmtpProvider) and smtp.config['password'] == 'pw'
     with pytest.raises(ValueError):
         providers.get_provider({'provider': 'carrier-pigeon', 'api_key': 'k'})
+    with pytest.raises(ValueError):
+        providers.get_provider({'provider': 'resend', 'api_key': 'k'})  # withdrawn
 
 
 # ───────────────────────── fake database for router tests ─────────────────────────
@@ -379,7 +326,9 @@ class FakeDB:
 
 @pytest.fixture
 def db(monkeypatch):
-    fake = FakeDB()
+    """A database where the signed-in user is on the Pro plan (connecting a
+    mailbox is a Pro feature). Tests about other plans build their own."""
+    fake = FakeDB({'raptor_users': [{'plan': 'Pro'}]})
     monkeypatch.setattr(email_router, 'supabase', fake)
     return fake
 
@@ -389,6 +338,7 @@ def _create(payload):
 
 
 BASE = {'label': 'L', 'from_email': 'me@example.com', 'from_name': 'Me', 'api_key': 'secret-key'}
+SMTP_BASE = {**BASE, 'provider': 'smtp', 'smtp_config': GOOD, 'accepted_risks_version': email_router.RISKS_VERSION}
 
 
 @pytest.fixture
@@ -404,28 +354,62 @@ def smtp_off_unless_asked(monkeypatch):
 
 # ───────────────────────── account creation ─────────────────────────
 
-def test_resend_free_defaults_fit_the_free_plan(db):
-    _create({**BASE})
+def test_resend_cannot_be_connected_any_more(db, smtp_on):
+    with pytest.raises(HTTPException) as err:
+        _create({**SMTP_BASE, 'provider': 'resend'})
+    assert err.value.status_code == 400 and 'Use one of: smtp' in err.value.detail
+    assert db.inserted('email_accounts') == []
+
+
+def test_a_mailbox_is_the_default_and_starts_at_human_pace(db, monkeypatch, smtp_on):
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    payload = {k: v for k, v in SMTP_BASE.items() if k != 'provider'}  # provider omitted -> smtp
+    _create(payload)
     row = db.inserted('email_accounts')[0]
-    assert (row['daily_cap'], row['warmup_target']) == (20, 100) and row['provider'] == 'resend'
+    assert row['provider'] == 'smtp' and (row['daily_cap'], row['warmup_target']) == (10, 20)
 
 
-def test_resend_paid_plan_gets_a_higher_ceiling(db):
-    _create({**BASE, 'plan': 'paid'})
+def test_the_risk_confirmation_is_required(db, monkeypatch, smtp_on):
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    no_version = {k: v for k, v in SMTP_BASE.items() if k != 'accepted_risks_version'}
+    for bad in (no_version,
+                {**SMTP_BASE, 'accepted_risks_version': ''},
+                {**SMTP_BASE, 'accepted_risks_version': True},          # the old boolean form
+                {**SMTP_BASE, 'accepted_risks_version': '2000-01-01'}):  # wording that is no longer current
+        with pytest.raises(HTTPException) as err:
+            _create(bad)
+        assert err.value.status_code == 400 and 'confirm' in err.value.detail
+    assert db.inserted('email_accounts') == []
+
+
+def test_acceptance_is_stored_with_the_server_clock_and_the_wording_version(db, monkeypatch, smtp_on):
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    before = datetime.now(timezone.utc)
+    _create({**SMTP_BASE, 'risks_accepted_at': '1999-01-01T00:00:00+00:00'})  # a forged timestamp must be ignored
     row = db.inserted('email_accounts')[0]
-    assert (row['daily_cap'], row['warmup_target']) == (20, 300)
+    stamped = datetime.fromisoformat(row['risks_accepted_at'])
+    assert before <= stamped <= datetime.now(timezone.utc)
+    assert row['risks_accepted_version'] == email_router.RISKS_VERSION
 
 
-def test_unknown_plan_falls_back_to_the_safe_free_limits(db):
-    _create({**BASE, 'plan': 'enterprise-unlimited'})
-    assert db.inserted('email_accounts')[0]['warmup_target'] == 100
+def test_a_client_cannot_choose_the_stored_version(db, monkeypatch, smtp_on):
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    _create({**SMTP_BASE, 'risks_accepted_version': 'made-up'})
+    assert db.inserted('email_accounts')[0]['risks_accepted_version'] == email_router.RISKS_VERSION
+
+
+def test_the_providers_endpoint_serves_the_statement_that_gets_recorded(monkeypatch, smtp_on):
+    body = email_router.available_providers(user_id='u')
+    assert body['risks_version'] == email_router.RISKS_VERSION
+    assert body['risks_statement'] == email_router.RISKS_STATEMENT
+    assert 'solely responsible' in body['risks_statement'] and 'DPDP' in body['risks_statement']
 
 
 def test_smtp_account_stores_settings_but_encrypts_the_password(db, monkeypatch, smtp_on):
     _resolve_to(monkeypatch, PUBLIC_IP)
-    _create({**BASE, 'api_key': 'mailbox-pass', 'provider': 'smtp', 'smtp_config': {**GOOD, 'password': 'leak?'}})
+    _create({**SMTP_BASE, 'api_key': 'mailbox-pass', 'smtp_config': {**GOOD, 'password': 'leak?'}})
     row = db.inserted('email_accounts')[0]
-    assert row['provider'] == 'smtp' and (row['daily_cap'], row['warmup_target']) == (10, 40)
+    assert row['provider'] == 'smtp' and (row['daily_cap'], row['warmup_target']) == (10, 20)
     assert row['smtp_config'] == {'host': 'smtp.example.com', 'port': 587, 'username': 'me@example.com', 'security': 'starttls'}
     assert 'mailbox-pass' not in str(row) and 'leak?' not in str(row)
     assert key_vault.decrypt_key(row['encrypted_api_key']) == 'mailbox-pass'
@@ -434,17 +418,17 @@ def test_smtp_account_stores_settings_but_encrypts_the_password(db, monkeypatch,
 def test_smtp_with_bad_settings_is_a_400_and_saves_nothing(db, monkeypatch, smtp_on):
     _resolve_to(monkeypatch, '127.0.0.1')
     with pytest.raises(HTTPException) as err:
-        _create({**BASE, 'provider': 'smtp', 'smtp_config': GOOD})
+        _create({**SMTP_BASE, 'smtp_config': GOOD})
     assert err.value.status_code == 400 and db.inserted('email_accounts') == []
 
 
 def test_unknown_provider_is_a_400(db):
     with pytest.raises(HTTPException) as err:
         _create({**BASE, 'provider': 'sendgrid'})
-    assert err.value.status_code == 400 and 'resend, smtp' in err.value.detail
+    assert err.value.status_code == 400 and 'Use one of: smtp' in err.value.detail
 
 
-def test_smtp_test_endpoint_reports_success_and_failure(monkeypatch, smtp_on):
+def test_smtp_test_endpoint_reports_success_and_failure(db, monkeypatch, smtp_on):
     _resolve_to(monkeypatch, PUBLIC_IP)
     monkeypatch.setattr(providers.SmtpProvider, 'check_connection', lambda self: None)
     assert email_router.test_smtp_connection({'smtp_config': GOOD, 'password': 'pw'}, user_id='u') == {'ok': True}
@@ -463,8 +447,8 @@ def test_smtp_test_endpoint_reports_success_and_failure(monkeypatch, smtp_on):
 
 # ───────────────────────── the send loop ─────────────────────────
 
-ACCOUNT = {'id': 'acct-1', 'from_email': 'me@example.com', 'from_name': 'Me', 'provider': 'resend',
-           'daily_cap': 20, 'warmup_target': 100}
+ACCOUNT = {'id': 'acct-1', 'from_email': 'me@example.com', 'from_name': 'Me', 'provider': 'smtp',
+           'daily_cap': 10, 'warmup_target': 20}
 CAMPAIGN = {'id': 'camp-1', 'account_id': 'acct-1', 'status': 'sending', 'subject': 'Hi {{first_name}}',
             'body_html': '<p>Hello</p><a href="{{unsubscribe_url}}">unsubscribe</a>', 'email_accounts': ACCOUNT}
 
@@ -552,20 +536,20 @@ def test_smtp_is_off_when_the_variable_is_not_set():
 
 
 def test_the_providers_endpoint_reports_the_switch(monkeypatch):
-    assert email_router.available_providers(user_id='u') == {'resend': True, 'smtp': False}
+    assert email_router.available_providers(user_id='u') == {'smtp': False, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
     monkeypatch.setenv('EMAIL_SMTP_ENABLED', 'true')
-    assert email_router.available_providers(user_id='u') == {'resend': True, 'smtp': True}
+    assert email_router.available_providers(user_id='u') == {'smtp': True, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
 
 
 def test_creating_an_smtp_account_is_refused_while_off_and_saves_nothing(db, monkeypatch):
     _resolve_to(monkeypatch, PUBLIC_IP)
     with pytest.raises(HTTPException) as err:
-        _create({**BASE, 'provider': 'smtp', 'smtp_config': GOOD})
+        _create(SMTP_BASE)
     assert err.value.status_code == 400 and "isn't switched on" in err.value.detail
     assert db.inserted('email_accounts') == []
 
 
-def test_the_connection_test_is_refused_while_off(monkeypatch):
+def test_the_connection_test_is_refused_while_off(db, monkeypatch):
     _resolve_to(monkeypatch, PUBLIC_IP)
     called = []
     monkeypatch.setattr(providers.SmtpProvider, 'check_connection', lambda self: called.append(1))
@@ -574,12 +558,9 @@ def test_the_connection_test_is_refused_while_off(monkeypatch):
     assert err.value.status_code == 400 and called == []  # never even tried to connect
 
 
-def test_resend_accounts_are_unaffected_by_the_switch(db):
-    _create({**BASE})  # SMTP switch is off (autouse fixture); Resend must still work
-    assert db.inserted('email_accounts')[0]['provider'] == 'resend'
 
 
-def test_an_unreachable_mail_server_gives_a_clear_400_from_the_test_endpoint(monkeypatch, smtp_on):
+def test_an_unreachable_mail_server_gives_a_clear_400_from_the_test_endpoint(db, monkeypatch, smtp_on):
     _resolve_to(monkeypatch, PUBLIC_IP)
 
     def blocked(self):
@@ -603,3 +584,74 @@ def test_an_unreachable_provider_pauses_the_campaign_and_keeps_recipients_pendin
     assert len(calls) == 1
     assert all(u.get('status') != 'failed' for u in loop.updates('email_campaign_recipients'))
     assert email_router._send_one_batch('camp-1')['skipped'] == 'provider_rate_limited'  # and does not retry at once
+
+
+# ───────────────────────── the Pro lock ─────────────────────────
+
+def _with_plan(monkeypatch, rows):
+    fake = FakeDB({'raptor_users': rows} if rows is not None else {})
+    monkeypatch.setattr(email_router, 'supabase', fake)
+    return fake
+
+
+@pytest.mark.parametrize('rows', [[{'plan': 'Free'}], [{'plan': None}], [{}], [], [{'plan': 'free'}], [{'plan': 'Pro-ish'}], [{'plan': ''}]])
+def test_connecting_a_mailbox_is_refused_unless_the_plan_is_pro(monkeypatch, smtp_on, rows):
+    fake = _with_plan(monkeypatch, rows)
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    with pytest.raises(HTTPException) as err:
+        _create(SMTP_BASE)
+    assert err.value.status_code == 403 and 'Pro plan' in err.value.detail
+    assert fake.inserted('email_accounts') == []
+
+
+@pytest.mark.parametrize('plan', ['Pro', 'pro', 'PRO'])
+def test_pro_in_any_case_may_connect(monkeypatch, smtp_on, plan):
+    fake = _with_plan(monkeypatch, [{'plan': plan}])
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    _create(SMTP_BASE)
+    assert len(fake.inserted('email_accounts')) == 1
+
+
+def test_the_connection_test_is_pro_only_too_and_never_touches_the_mail_server(monkeypatch, smtp_on):
+    _with_plan(monkeypatch, [{'plan': 'Free'}])
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    contacted = []
+    monkeypatch.setattr(providers.SmtpProvider, 'check_connection', lambda self: contacted.append(1))
+    with pytest.raises(HTTPException) as err:
+        email_router.test_smtp_connection({'smtp_config': GOOD, 'password': 'pw'}, user_id='user-1')
+    assert err.value.status_code == 403 and contacted == []
+
+
+def test_the_plan_is_checked_before_anything_else(monkeypatch):
+    """A free user gets the upgrade message, not a validation error, and the
+    server flag doesn't matter."""
+    _with_plan(monkeypatch, [{'plan': 'Free'}])
+    with pytest.raises(HTTPException) as err:
+        _create({})                                                   # not even a valid request
+    assert err.value.status_code == 403
+
+
+def test_if_the_plan_cannot_be_verified_the_answer_is_no(monkeypatch, smtp_on):
+    class Broken:
+        def table(self, name):
+            raise RuntimeError('database unreachable')
+    monkeypatch.setattr(email_router, 'supabase', Broken())
+    with pytest.raises(HTTPException) as err:
+        _create(SMTP_BASE)
+    assert err.value.status_code == 502 and 'verify your plan' in err.value.detail
+
+
+def test_the_plan_is_looked_up_for_the_signed_in_user_only(monkeypatch, smtp_on):
+    seen = []
+
+    class Spy(FakeQuery):
+        def eq(self, column, value):
+            seen.append((self.table, column, value))
+            return self
+    fake = FakeDB({'raptor_users': [{'plan': 'Pro'}]})
+    fake.table = lambda name: Spy(fake, name)
+    monkeypatch.setattr(email_router, 'supabase', fake)
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    _create({**SMTP_BASE, 'owner_id': 'someone-else', 'user_id': 'someone-else'})   # a forged id in the body is ignored
+    assert ('raptor_users', 'user_id', 'user-1') in seen
+    assert all(v != 'someone-else' for _t, _c, v in seen)

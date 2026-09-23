@@ -1,7 +1,6 @@
 """
 key_vault.py — encrypted storage for the user's own email-sending provider
-credentials (Resend API key today; SMTP password once that provider is
-wired for real). Own secret, EMAIL_KEY_ENCRYPTION_SECRET, kept separate
+credentials (the mailbox password for SMTP). Own secret, EMAIL_KEY_ENCRYPTION_SECRET, kept separate
 from ai_integration's CONTENT_KEY_ENCRYPTION_SECRET and whatsapp's
 WHATSAPP_KEY_ENCRYPTION_SECRET even though all three now live in the same
 process — a leak of one secret still shouldn't expose the other two.

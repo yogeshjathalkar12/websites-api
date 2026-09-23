@@ -2,13 +2,10 @@
 One interface, swappable providers. Add a new provider by implementing
 send() — the sender loop doesn't care which one it's talking to.
 
-Two providers today:
-  * resend — the customer's own Resend account, over Resend's HTTPS API.
-    Fine for transactional mail and opted-in marketing; Resend's
-    acceptable-use policy does NOT allow cold outreach.
-  * smtp   — the customer's own mailbox or relay (Google Workspace,
-    Microsoft 365, Zoho, Brevo, Mailgun, ...). This is the route for
-    ordinary one-to-one sales outreach from a real mailbox.
+One provider today:
+  * smtp — the customer's own mailbox or relay (Google Workspace,
+    Microsoft 365, Zoho, ...). Every send goes out from a mailbox the
+    customer owns, at a human pace.
 
 send() returns the provider's message id. It raises ProviderRateLimited
 when the provider or mailbox says "you've hit your limit, try later" —
@@ -21,15 +18,12 @@ import re
 import smtplib
 import socket
 import ssl
-import threading
 from abc import ABC, abstractmethod
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from html import unescape
 
-import resend
-
-SUPPORTED_PROVIDERS = ('resend', 'smtp')
+SUPPORTED_PROVIDERS = ('smtp',)
 
 # 25/465/587 are the standard SMTP ports; 2525 is the common alternative
 # offered by relays (Brevo, Mailgun, SendGrid, ...) precisely because
@@ -65,45 +59,6 @@ class EmailProvider(ABC):
     def send(self, from_email: str, from_name: str, to: str, subject: str, html: str) -> str:
         """Returns the provider's message ID."""
         ...
-
-
-# ---------------------------------------------------------------------------
-# Resend
-# ---------------------------------------------------------------------------
-
-# The Resend SDK keeps the API key in one module-level global. Requests
-# for different customers are served on different threads, so without
-# this lock one customer's send could go out under another customer's
-# key (or a send could run while the global holds a stale key).
-_resend_lock = threading.Lock()
-
-
-def _is_resend_rate_limit(err: Exception) -> bool:
-    code = str(getattr(err, 'code', '') or '')
-    error_type = str(getattr(err, 'error_type', '') or '').lower()
-    return code == '429' or 'quota' in error_type or 'rate_limit' in error_type
-
-
-class ResendProvider(EmailProvider):
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def send(self, from_email: str, from_name: str, to: str, subject: str, html: str) -> str:
-        payload = {
-            "from": f"{from_name} <{from_email}>",
-            "to": [to],
-            "subject": subject,
-            "html": html,
-        }
-        try:
-            with _resend_lock:
-                resend.api_key = self.api_key
-                result = resend.Emails.send(payload)
-        except resend.exceptions.ResendError as err:
-            if _is_resend_rate_limit(err):
-                raise ProviderRateLimited(str(err)) from err
-            raise
-        return result["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +217,6 @@ def get_provider(account: dict) -> EmailProvider:
     """`account` is the email_accounts row with the secret already
     decrypted into account['api_key'] (see sending.get_ready_provider).
     For SMTP that secret is the mailbox password."""
-    if account['provider'] == 'resend':
-        return ResendProvider(account['api_key'])
     if account['provider'] == 'smtp':
         config = dict(account.get('smtp_config') or {})
         config['password'] = account.get('api_key')

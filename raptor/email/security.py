@@ -22,18 +22,3 @@ def sign_unsubscribe_token(account_id: str, email: str) -> str:
 
 def verify_unsubscribe_token(account_id: str, email: str, token: str) -> bool:
     return hmac.compare_digest(sign_unsubscribe_token(account_id, email), token or '')
-
-
-def verify_resend_webhook(payload_bytes: bytes, headers: dict) -> None:
-    """Resend signs webhooks via svix. Requires RESEND_WEBHOOK_SECRET from
-    your Resend dashboard's webhook settings."""
-    from svix.webhooks import Webhook, WebhookVerificationError
-
-    secret = os.environ.get('RESEND_WEBHOOK_SECRET')
-    if not secret:
-        raise HTTPException(status_code=500, detail="RESEND_WEBHOOK_SECRET is not configured on this server.")
-    wh = Webhook(secret)
-    try:
-        wh.verify(payload_bytes, headers)
-    except WebhookVerificationError:
-        raise HTTPException(status_code=401, detail="Invalid webhook signature.")

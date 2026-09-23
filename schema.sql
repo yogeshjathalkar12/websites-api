@@ -389,7 +389,7 @@ CREATE TABLE public.email_accounts (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   owner_id uuid NOT NULL,
   label text NOT NULL,
-  provider text NOT NULL DEFAULT 'resend'::text,
+  provider text NOT NULL DEFAULT 'smtp'::text,
   from_email text NOT NULL,
   from_name text NOT NULL,
   encrypted_api_key text NOT NULL,
@@ -403,6 +403,8 @@ CREATE TABLE public.email_accounts (
   created_at timestamp with time zone NOT NULL DEFAULT now(),
   inbound_webhook_secret text,
   encrypted_shopify_webhook_secret text,
+  risks_accepted_at timestamp with time zone,
+  risks_accepted_version text,
   CONSTRAINT email_accounts_pkey PRIMARY KEY (id),
   CONSTRAINT email_accounts_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES auth.users(id)
 );

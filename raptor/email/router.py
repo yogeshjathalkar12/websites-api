@@ -30,7 +30,6 @@ Endpoints:
   POST /sequence-tick                — cron-only, sends due sequence steps and advances enrollments
   POST /campaigns/{id}/ab-test/declare-winner — manually pick a winning variant now (see ab_testing.py)
   POST /ab-test-tick                 — cron-only, auto-finalizes AB tests whose duration has elapsed
-  POST /webhooks/resend              — signature-verified bounce/complaint handling
   GET  /unsubscribe                  — token-verified suppression
   GET  /track/open, /track/click     — open/click tracking (see tracking.py)
 
@@ -64,7 +63,7 @@ from . import reputation
 from . import sending
 from .spintax import render_email
 from .warmup import todays_allowed_volume, sent_today_count, within_business_hours
-from .security import verify_unsubscribe_token, verify_resend_webhook
+from .security import verify_unsubscribe_token
 
 # 1x1 transparent GIF served by /track/open — smallest valid GIF89a.
 _PIXEL_GIF = bytes.fromhex(
@@ -154,36 +153,61 @@ def reputation_tick():
 
 # Starting volume and ramp target per kind of account. The ramp adds
 # WARMUP_DAILY_STEP per day from daily_cap up to warmup_target (warmup.py).
-#   resend/free  — Resend's Free plan stops at 100 emails a day, so the
-#                  target never goes above that.
-#   resend/paid  — no daily limit on Resend's side; 300/day is still a
-#                  sensible ceiling for a domain that is building a reputation.
-#   smtp         — a normal mailbox; 40/day is a safe level for one-to-one
-#                  outreach (Gmail and Microsoft cap and flag much lower than
-#                  their published limits when volume jumps).
-RESEND_FREE_DAILY_LIMIT = 100
+#   A customer's own mailbox is the only way to connect a new account.
+#   10 a day growing to 20 is deliberately human-paced: Gmail and Microsoft
+#   flag mailboxes far below their published limits when volume jumps.
+#   (This server's own system emails — login codes, licence mail — use a
+#   separate service, see utility/notifications.py.)
 SENDING_DEFAULTS = {
-    ('resend', 'free'): {'daily_cap': 20, 'warmup_target': RESEND_FREE_DAILY_LIMIT},
-    ('resend', 'paid'): {'daily_cap': 20, 'warmup_target': 300},
-    ('smtp', 'free'): {'daily_cap': 10, 'warmup_target': 40},
+    'smtp': {'daily_cap': 10, 'warmup_target': 20},
 }
 
+CREATABLE_PROVIDERS = ('smtp',)
 
 SMTP_OFF_MESSAGE = ("Sending from your own mailbox isn't switched on for this server yet. "
-                    "Use Resend for now, or ask us when mailbox sending will be available.")
+                    "Ask us when mailbox sending will be available.")
+
+# What the customer confirms when connecting a mailbox. The wording lives
+# here, not in the browser, so what is stored as accepted is exactly what
+# was shown. CHANGING THE TEXT MEANS BUMPING THE VERSION: the version is
+# recorded with each acceptance, and an acceptance sent for an old version
+# is refused, so nobody can confirm wording they were not shown.
+RISKS_VERSION = '2026-09-23'
+RISKS_STATEMENT = (
+    "I understand I am solely responsible for who I email and for following the laws that apply "
+    "to my recipients (for example the DPDP Act and IT rules in India, GDPR in the EU, CAN-SPAM in "
+    "the US). Raptor does not check whether recipients have agreed to hear from me. Gmail, "
+    "Microsoft or my mail host can limit or suspend my mailbox if it sends unwanted mail."
+)
+PRO_MESSAGE = ("Email automation is part of the Pro plan. Upgrade to Pro to connect your own mailbox.")
 
 
-def _sending_defaults(provider: str, plan: str) -> dict:
-    if provider == 'resend':
-        return SENDING_DEFAULTS[('resend', 'paid' if plan == 'paid' else 'free')]
-    return SENDING_DEFAULTS[('smtp', 'free')]
+def _require_pro(user_id: str) -> None:
+    """Connecting a mailbox is a Pro feature. Read from raptor_users.plan,
+    the same place billing writes it (billing_router.py), on the server, so
+    it can't be bypassed from the browser. If the plan can't be verified
+    the answer is no, not "probably fine"."""
+    try:
+        rows = (
+            supabase.table('raptor_users').select('plan').eq('user_id', user_id).limit(1).execute().data
+        ) or []
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not verify your plan right now. Please try again.")
+    plan = str((rows[0] if rows else {}).get('plan') or 'Free')
+    if plan.lower() != 'pro':
+        raise HTTPException(status_code=403, detail=PRO_MESSAGE)
+
+
+RISKS_MESSAGE = ("Please confirm the statement about your responsibilities before connecting. "
+                 "If you already did, reload the page — the wording may have been updated.")
 
 
 @router.get("/providers")
 def available_providers(user_id: str = Depends(get_current_user)):
-    """Which ways of sending this server currently supports, so the setup
-    screen can hide the ones that aren't switched on."""
-    return {'resend': True, 'smtp': providers.smtp_enabled()}
+    """Which ways of connecting a new account this server currently
+    supports, plus the responsibilities statement the customer must confirm
+    (and its version) so the screen shows exactly what gets recorded."""
+    return {'smtp': providers.smtp_enabled(), 'risks_version': RISKS_VERSION, 'risks_statement': RISKS_STATEMENT}
 
 
 @router.post("/accounts/test-smtp")
@@ -191,6 +215,7 @@ def test_smtp_connection(payload: dict = Body(...), user_id: str = Depends(get_c
     """Logs in to the customer's mail server and disconnects, without
     sending anything, so the setup screen can say "connected" before the
     account is saved. The password is used for this one call only."""
+    _require_pro(user_id)
     if not providers.smtp_enabled():
         raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
     password = str(payload.get('password', ''))
@@ -206,25 +231,25 @@ def test_smtp_connection(payload: dict = Body(...), user_id: str = Depends(get_c
 
 @router.post("/accounts")
 def create_account(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
+    _require_pro(user_id)
     required = ['label', 'from_email', 'from_name', 'api_key']
     missing = [f for f in required if not str(payload.get(f, '')).strip()]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required field(s): {', '.join(missing)}")
 
-    provider = payload.get('provider', 'resend')
-    if provider not in providers.SUPPORTED_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Use one of: {', '.join(providers.SUPPORTED_PROVIDERS)}.")
+    provider = payload.get('provider', 'smtp')
+    if provider not in CREATABLE_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Use one of: {', '.join(CREATABLE_PROVIDERS)}.")
+    if payload.get('accepted_risks_version') != RISKS_VERSION:
+        raise HTTPException(status_code=400, detail=RISKS_MESSAGE)
+    if not providers.smtp_enabled():
+        raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
+    try:
+        smtp_config = providers.validate_smtp_config(payload.get('smtp_config') or {})
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
 
-    smtp_config = None
-    if provider == 'smtp':
-        if not providers.smtp_enabled():
-            raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
-        try:
-            smtp_config = providers.validate_smtp_config(payload.get('smtp_config') or {})
-        except ValueError as err:
-            raise HTTPException(status_code=400, detail=str(err))
-
-    caps = _sending_defaults(provider, str(payload.get('plan', 'free')))
+    caps = SENDING_DEFAULTS['smtp']
 
     row = {
         'owner_id': user_id,
@@ -238,6 +263,11 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
         'smtp_config': smtp_config,
         'daily_cap': caps['daily_cap'],
         'warmup_target': caps['warmup_target'],
+        # Proof of the confirmation: the server's clock, and the exact version
+        # of the wording shown. Never taken from the request. A database
+        # trigger stops customers editing these directly (see migrations/).
+        'risks_accepted_at': datetime.now(timezone.utc).isoformat(),
+        'risks_accepted_version': RISKS_VERSION,
         # Compared with hmac.compare_digest on inbound webhooks, never
         # decrypted — a plain random token is enough, no need for
         # key_vault here.
@@ -719,37 +749,6 @@ def _suppress(account_id: str, email: str, reason: str):
         {'account_id': account_id, 'email': email, 'reason': reason},
         on_conflict='account_id,email',
     ).execute()
-
-
-@router.post("/webhooks/resend")
-async def resend_webhook(request: Request):
-    body = await request.body()
-    verify_resend_webhook(body, dict(request.headers))
-    payload = await request.json()
-    event_type = payload.get('type')
-    data = payload.get('data', {})
-    to_list = data.get('to', [])
-    email = to_list[0] if to_list else None
-
-    event_row = (
-        supabase.table('email_events')
-        .select('account_id')
-        .eq('provider_message_id', data.get('email_id'))
-        .limit(1)
-        .execute()
-        .data
-    )
-    account_id = event_row[0]['account_id'] if event_row else None
-
-    if account_id and email:
-        if event_type == 'email.bounced':
-            _suppress(account_id, email, 'bounced')
-            supabase.table('email_events').insert({'account_id': account_id, 'contact_email': email, 'event_type': 'bounced'}).execute()
-        elif event_type == 'email.complained':
-            _suppress(account_id, email, 'complained')
-            supabase.table('email_events').insert({'account_id': account_id, 'contact_email': email, 'event_type': 'complained'}).execute()
-
-    return {'ok': True}
 
 
 def _parse_tracking_id(r: str) -> tuple:
