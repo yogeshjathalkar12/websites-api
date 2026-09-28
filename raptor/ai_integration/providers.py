@@ -18,6 +18,8 @@ three different SDKs with three different conventions.
 """
 
 import base64
+import time
+
 import httpx
 
 
@@ -101,6 +103,23 @@ class ProviderError(Exception):
     pass
 
 
+def _post_with_retry(url: str, *, retries: int = 2, backoff: float = 1.5, **kwargs) -> httpx.Response:
+    """A 503 from these providers is typically transient overload, not a real
+    failure - Google's own body on it says "usually temporary... try again
+    later." Retry a couple of times with a short pause before handing the
+    response to the caller, instead of making the user manually re-click
+    save/generate for something that resolves itself within a couple seconds.
+    Any other status (including a genuine error) is returned immediately."""
+    resp = None
+    for attempt in range(retries):
+        resp = httpx.post(url, **kwargs)
+        if resp.status_code != 503:
+            return resp
+        if attempt < retries - 1:
+            time.sleep(backoff)
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Key validation — one cheap call per modality the provider *could* support,
 # so we store what this specific key can actually do, not just what the
@@ -163,7 +182,7 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
                 {"type": "image_url", "image_url": {"url": f"data:{img['media_type']};base64,{img['data_base64']}"}}
                 for img in images
             ]
-        resp = httpx.post(
+        resp = _post_with_retry(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens},
@@ -179,7 +198,7 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
                 {"type": "image", "source": {"type": "base64", "media_type": img["media_type"], "data": img["data_base64"]}}
                 for img in images
             ]
-        resp = httpx.post(
+        resp = _post_with_retry(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": api_key,
@@ -197,7 +216,7 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
         parts = [{"text": prompt}]
         for img in images:
             parts.append({"inline_data": {"mime_type": img["media_type"], "data": img["data_base64"]}})
-        resp = httpx.post(
+        resp = _post_with_retry(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             params={"key": api_key},
             json={"contents": [{"parts": parts}]},
@@ -220,7 +239,7 @@ def call_text(provider: str, api_key: str, model: str, prompt: str, max_tokens: 
 
 def call_image(provider: str, api_key: str, model: str, prompt: str) -> str:
     if provider == "openai":
-        resp = httpx.post(
+        resp = _post_with_retry(
             "https://api.openai.com/v1/images/generations",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": model, "prompt": prompt, "size": "1024x1024", "response_format": "b64_json"},
@@ -231,7 +250,7 @@ def call_image(provider: str, api_key: str, model: str, prompt: str) -> str:
         return f"data:image/png;base64,{b64}"
 
     if provider == "google":
-        resp = httpx.post(
+        resp = _post_with_retry(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:predict",
             params={"key": api_key},
             json={"instances": [{"prompt": prompt}], "parameters": {"sampleCount": 1}},
@@ -258,7 +277,7 @@ def call_image(provider: str, api_key: str, model: str, prompt: str) -> str:
 
 def start_video_job(provider: str, api_key: str, model: str, prompt: str) -> str:
     if provider == "google":
-        resp = httpx.post(
+        resp = _post_with_retry(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:predictLongRunning",
             params={"key": api_key},
             json={"instances": [{"prompt": prompt}]},

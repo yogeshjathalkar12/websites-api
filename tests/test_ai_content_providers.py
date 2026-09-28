@@ -179,6 +179,42 @@ def test_google_image_and_video_are_off_rather_than_pointing_at_dead_models():
 # route refuses a disabled modality BEFORE it ever reaches the network, with a
 # clean message, rather than building a request against a dead model.
 
+# ───────────────────────── transient 503 retry ─────────────────────────
+# The bug this guards against: a save-key click that hit Google while it was
+# briefly overloaded (a real, live "high demand... try again later" 503,
+# 2026-09-28) surfaced straight to the user with no retry, so a blip the
+# provider itself calls transient made the user manually re-click save.
+
+def test_a_503_that_clears_on_retry_succeeds_transparently(fake_post, monkeypatch):
+    monkeypatch.setattr(providers.time, "sleep", lambda *_: None)
+    fake_post.append(resp(503, {"error": {"message": "model overloaded"}}))
+    fake_post.append(resp(200, {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}))
+    caps = providers.validate_key("google", "a-real-working-key")
+    assert caps == {"text": True, "image": False, "video": False}
+    assert fake_post == []  # both queued responses were consumed
+
+
+def test_a_503_that_never_clears_still_surfaces_after_retrying(fake_post, monkeypatch):
+    monkeypatch.setattr(providers.time, "sleep", lambda *_: None)
+    fake_post.append(resp(503, {"error": {"message": "model overloaded"}}))
+    fake_post.append(resp(503, {"error": {"message": "model overloaded"}}))
+    with pytest.raises(providers.ProviderError, match="model overloaded"):
+        providers.validate_key("google", "a-real-working-key")
+    assert fake_post == []  # retried exactly once, then gave up - not an infinite loop
+
+
+def test_a_real_error_status_is_not_retried_at_all(fake_post, monkeypatch):
+    """A 401 means the key is bad, not that the provider is busy - retrying
+    it would just be three slow ways of learning the same thing."""
+    def fail_if_called_again(*_a, **_k):
+        raise AssertionError("should not have retried a non-503 error")
+    monkeypatch.setattr(providers.time, "sleep", fail_if_called_again)
+    fake_post.append(resp(401, {"error": {"message": "Invalid Authentication"}}))
+    with pytest.raises(providers.ProviderError, match="Invalid Authentication"):
+        providers.validate_key("google", "bad-key")
+    assert fake_post == []
+
+
 def test_the_pipeline_route_refuses_googles_disabled_image_modality_up_front(fake_post, monkeypatch):
     from raptor.ai_integration import content_router
 
