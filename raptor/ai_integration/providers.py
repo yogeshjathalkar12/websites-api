@@ -66,9 +66,25 @@ PROVIDER_CAPABILITIES = {
         "video": None,
     },
     "google": {
-        "text": "gemini-2.5-flash",
-        "image": "imagen-4.0-generate-001",
-        "video": "veo-3.0-generate-001",
+        # gemini-2.5-flash was retired 2026-09: Google's own API now
+        # answers with "This model models/gemini-2.5-flash is no longer
+        # available to new users. Please update your code to use
+        # models/gemini-3.8-flash" - confirmed live, with a real key,
+        # 2026-09-28. gemini-3.8-flash reached general availability
+        # 2026-09-02 (https://ai.google.dev/gemini-api/docs/models).
+        "text": "gemini-3.8-flash",
+        # image/video: Google shut down the entire Imagen product line on
+        # 2026-08-17 (https://ai.google.dev/gemini-api/docs/deprecations)
+        # and replaced it with "Gemini Image" ("Nano Banana") models that,
+        # per current docs, use a DIFFERENT API (a new "Interactions"
+        # endpoint, not the generateContent/:predict shape call_image()
+        # below assumes) - not just a different model string. Left
+        # unsupported rather than guessing at an unverified request shape
+        # with a real paid key; needs a hands-on rebuild against
+        # https://ai.google.dev/gemini-api/docs/image-generation and
+        # .../docs/veo before turning these back on.
+        "image": None,
+        "video": None,
     },
     "anthropic": {
         "text": "claude-sonnet-5",

@@ -81,7 +81,13 @@ def test_every_provider_surfaces_its_own_real_reason(fake_post, provider, body, 
 def test_a_key_that_genuinely_works_is_confirmed(fake_post):
     fake_post.append(resp(200, {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}))
     caps = providers.validate_key("google", "a-real-working-key")
-    assert caps == {"text": True, "image": True, "video": True}  # google supports all three
+    assert caps == {"text": True, "image": False, "video": False}  # image/video are off, see below
+
+
+def test_a_key_that_genuinely_works_is_confirmed_for_a_provider_with_all_three(fake_post):
+    fake_post.append(resp(200, {"choices": [{"message": {"content": "ok"}}]}))
+    caps = providers.validate_key("openai", "sk-a-real-working-key")
+    assert caps == {"text": True, "image": True, "video": False}  # openai: no video
 
 
 def test_mutation_check_the_old_swallow_behaviour_is_gone(fake_post, monkeypatch):
@@ -148,3 +154,40 @@ def test_openai_and_anthropic_are_both_already_supported():
     they need adding."""
     assert providers.PROVIDER_CAPABILITIES["openai"]["text"]
     assert providers.PROVIDER_CAPABILITIES["anthropic"]["text"]
+
+
+# ───────────────────────── the model registry itself ─────────────────────────
+# Locks in the 2026-09-28 fix: the failing model name from the bug report,
+# and Google's own live error message pointing at its replacement.
+
+def test_google_text_uses_the_current_model_not_the_retired_one():
+    assert providers.PROVIDER_CAPABILITIES["google"]["text"] == "gemini-3.8-flash"
+    assert providers.PROVIDER_CAPABILITIES["google"]["text"] != "gemini-2.5-flash"
+
+
+def test_google_image_and_video_are_off_rather_than_pointing_at_dead_models():
+    """Imagen (the old image backend) was shut down; the replacement uses a
+    different API shape this codebase does not implement yet. Off is safer
+    than silently calling a dead endpoint - and the pipeline step-validation
+    below is what actually enforces that at request time."""
+    assert providers.PROVIDER_CAPABILITIES["google"]["image"] is None
+    assert providers.PROVIDER_CAPABILITIES["google"]["video"] is None
+
+
+# ───────────────────────── the pipeline endpoint's own guard ─────────────────────────
+# A None capability isn't just a registry value - confirm the actual /pipeline
+# route refuses a disabled modality BEFORE it ever reaches the network, with a
+# clean message, rather than building a request against a dead model.
+
+def test_the_pipeline_route_refuses_googles_disabled_image_modality_up_front(fake_post, monkeypatch):
+    from raptor.ai_integration import content_router
+
+    monkeypatch.setattr(content_router, "check_rate_limit", lambda user_id, modality: None)
+    monkeypatch.setattr(content_router.key_vault, "get_decrypted_key", lambda user_id, provider: "fake-key")
+
+    payload = {"steps": [{"provider": "google", "modality": "image", "prompt": "a picture of a cat"}]}
+    with pytest.raises(content_router.HTTPException) as err:
+        content_router.run_pipeline(payload, user_id="u1")
+    assert err.value.status_code == 400
+    assert "google" in err.value.detail and "image" in err.value.detail
+    assert fake_post == []  # refused before any network call was attempted
