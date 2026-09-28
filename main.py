@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # --- 1. IMPORT YOUR VENTURES ---
 # raptor.utility/ is the set of heavy-compute tools (8 original + the AI
@@ -51,6 +54,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- 2b. CATCH-ALL FOR UNHANDLED EXCEPTIONS ---
+# FastAPI/Starlette gotcha: CORSMiddleware only attaches CORS headers to
+# responses that come back through normal request handling (a route return,
+# or a raised HTTPException). A raw, *unhandled* exception is caught by
+# Starlette's ServerErrorMiddleware, which sits OUTSIDE CORSMiddleware in
+# the stack - so its fallback 500 never gets CORS headers. The browser then
+# blocks the frontend from reading it and reports a generic "Failed to
+# fetch" / network error, hiding the real 500 and its message completely
+# (this is exactly what happened with the AI Content Suite's /keys route:
+# real 500 on the wire, CORS-blocked before JS ever saw it).
+# Registering this handler ourselves means we build and return the response
+# directly, so we control its headers regardless of where in the stack it's
+# invoked from - no unhandled exception can produce a CORS-less response.
+logger = logging.getLogger("uvicorn.error")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin in ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {exc}"},
+        headers=headers,
+    )
+
 
 # --- 3. BASE SERVER ROUTE ---
 @app.get("/")
