@@ -98,13 +98,21 @@ def validate_key(provider: str, api_key: str) -> dict:
 
     caps = PROVIDER_CAPABILITIES[provider]
     confirmed = {"text": False, "image": False, "video": False}
+    text_error = None
 
     if caps["text"]:
         try:
             call_text(provider, api_key, caps["text"], "Reply with just: ok", max_tokens=5)
             confirmed["text"] = True
-        except ProviderError:
-            pass
+        except ProviderError as e:
+            # THE FIX: this used to be `except ProviderError: pass` — the
+            # provider's own reason (bad key, API not enabled on this
+            # project, wrong region, etc.) was thrown away and replaced
+            # with a generic "did not validate" message below, which told
+            # the user nothing about what to actually fix. Google in
+            # particular returns a very specific message here
+            # (API_KEY_INVALID, PERMISSION_DENIED, ...); keep it.
+            text_error = str(e)
 
     # Image/video validation calls cost real money on the user's key, so we
     # don't fire a generation just to check — a working text call plus a
@@ -116,7 +124,9 @@ def validate_key(provider: str, api_key: str) -> dict:
         confirmed["video"] = True
 
     if not any(confirmed.values()):
-        raise ProviderError("Key did not validate against any supported modality.")
+        if text_error:
+            raise ProviderError(f"{provider} rejected this key: {text_error}")
+        raise ProviderError(f"'{provider}' has no text modality to validate against — this is a bug, not a bad key.")
 
     return confirmed
 
@@ -267,10 +277,29 @@ def poll_video_job(provider: str, api_key: str, job_id: str) -> dict:
     raise ProviderError(f"Provider '{provider}' does not support video generation.")
 
 
+def _extract_error_message(resp: httpx.Response) -> str | None:
+    """Every provider wraps its error as JSON with the useful text nested a
+    couple of levels down (OpenAI/Google: error.message: Anthropic:
+    error.message too, just a different envelope). Pull that out so the
+    user sees "API key not valid" instead of a raw, truncated JSON blob."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    err = body.get("error")
+    if isinstance(err, dict) and isinstance(err.get("message"), str):
+        return err["message"]
+    if isinstance(err, str):
+        return err
+    return None
+
+
 def _raise_for_provider_error(resp: httpx.Response, provider: str) -> None:
+    if resp.status_code < 400:
+        return
+    message = _extract_error_message(resp)
     if resp.status_code == 401:
-        raise ProviderError(f"{provider} rejected this API key (401).")
+        raise ProviderError(f"{provider} rejected this API key ({message or '401 Unauthorized'}).")
     if resp.status_code == 429:
         raise ProviderError(f"{provider} rate-limited this key — try again shortly.")
-    if resp.status_code >= 400:
-        raise ProviderError(f"{provider} error {resp.status_code}: {resp.text[:200]}")
+    raise ProviderError(f"{provider} error {resp.status_code}: {message or resp.text[:200]}")
