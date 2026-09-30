@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 # raptor.utility/ is the set of heavy-compute tools (8 original + the AI
 # Content Suite added after) -- each imported and mounted below.
 from raptor.raptor_router import router as raptor_router
+from raptor.relay_router import router as raptor_relay_router
 from raptor.utility.chronos_router import router as chronos_router
 from raptor.utility.kmeans_router import router as kmeans_router
 from raptor.utility.montecarlo_router import router as montecarlo_router
@@ -102,6 +103,12 @@ def read_root():
 # routes read as e.g. POST /api/raptor/kmeans/cluster,
 # GET /api/raptor/chronos/scheduled, etc.
 app.include_router(raptor_router, prefix="/api/raptor", tags=["Raptor"])
+# Raptor mobile relay (see raptor/relay_router.py) - a WebSocket pairing/
+# forwarding service so the Raptor mobile app can start a live-coached
+# call from anywhere, not just the desktop's own Wi-Fi. Reachable at
+# wss://<this-host>/api/raptor/relay/{client_id}. Never decodes audio or
+# touches the desktop's local DNA/Pattern data - pure connectivity.
+app.include_router(raptor_relay_router, prefix="/api/raptor", tags=["Raptor - Mobile Relay"])
 app.include_router(chronos_router, prefix="/api/raptor/chronos", tags=["Raptor - Chronos"])
 app.include_router(kmeans_router, prefix="/api/raptor/kmeans", tags=["Raptor - K-Means"])
 app.include_router(montecarlo_router, prefix="/api/raptor/montecarlo", tags=["Raptor - Monte Carlo"])

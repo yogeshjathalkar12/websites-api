@@ -28,3 +28,9 @@ webrtcvad
 razorpay
 cryptography
 resend
+
+# relay_router.py — verifies Supabase JWTs (RS256/ES256) via JWKS for the
+# Raptor mobile relay. supabase's own gotrue dependency likely pulls this
+# in transitively already, but pinned explicitly since relay auth
+# shouldn't depend on that staying true.
+pyjwt[crypto]
