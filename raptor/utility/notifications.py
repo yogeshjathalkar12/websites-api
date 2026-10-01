@@ -43,7 +43,20 @@ import os
 from supabase import create_client
 import resend
 
-_supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+# THE FIX: this used to be os.environ["SUPABASE_SERVICE_ROLE_KEY"] (bracket
+# access), which raises KeyError at IMPORT time if that var is missing.
+# Harmless while nothing in the codebase imported this module (it was dead
+# code), but billing_router.py and raptor_auth.py now import it at module
+# level - a missing env var would crash the entire multi-venture hub's boot,
+# not just notifications. Matches the graceful-degradation pattern every
+# other Supabase client in this codebase already uses (see raptor_auth.py).
+_SUPABASE_URL = os.environ.get("SUPABASE_URL")
+_SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+_supabase = (
+    create_client(_SUPABASE_URL, _SUPABASE_SERVICE_ROLE_KEY)
+    if _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY
+    else None
+)
 
 # Raptor's own transactional sender — same verified domain/account as the
 # Supabase Auth SMTP setup, used here via Resend's API directly instead of
@@ -111,6 +124,9 @@ def send_notification(
         raise ValueError(f"type must be one of {VALID_TYPES}, got {type!r}")
     if display_mode not in VALID_DISPLAY_MODES:
         raise ValueError(f"display_mode must be one of {VALID_DISPLAY_MODES}, got {display_mode!r}")
+    if _supabase is None:
+        print(f"[notifications] SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured — dropping notification '{title}'")
+        return None
 
     # Source of truth, always — this is what the bell/banner/modal read from.
     result = (
@@ -148,6 +164,9 @@ def broadcast_notification(
     deliberately than send_notification — mass-emailing every user on a
     single call is a real deliverability/reputation decision, not something
     to opt into casually. Confirm you actually want that before setting it."""
+    if _supabase is None:
+        print(f"[notifications] SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured — dropping broadcast '{title}'")
+        return {"sent_to": 0}
     all_ids: list[str] = []
     page = 1
     while True:

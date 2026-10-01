@@ -28,6 +28,7 @@ missing, billing is disabled rather than silently running on a stray
 default key.
 """
 
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -37,8 +38,10 @@ from pydantic import BaseModel
 
 # Same shared auth/credit module every other tool router uses.
 from .utility.raptor_auth import get_current_user, supabase
+from .utility.notifications import send_notification
 
 router = APIRouter()
+log = logging.getLogger("billing_router")
 
 # ── Plan config ──────────────────────────────────────────────────────
 # Single "Pro" plan for now. Change these two constants if pricing or
@@ -156,6 +159,19 @@ def verify_payment(payload: VerifyPaymentRequest, user_id: str = Depends(get_cur
             status_code=500,
             detail=f"Payment verified but upgrading the account failed: {e}. Contact support with this order ID: {payload.razorpay_order_id}",
         )
+
+    try:
+        send_notification(
+            owner_id=user_id,
+            title="Welcome to Raptor Pro!",
+            body=f"Your upgrade is live - {PRO_PLAN_CREDITS} credits added and every Pro feature is unlocked.",
+            type="success",
+            display_mode="banner",
+            action_label="Explore Pro features",
+            action_url="/ventures/raptor/dashboard.html",
+        )
+    except Exception as e:
+        log.error(f"Failed to send Pro-upgrade notification for {user_id}: {e}")
 
     return {"status": "success", "message": "Upgraded to Pro successfully!", "credits": PRO_PLAN_CREDITS}
 
@@ -328,6 +344,18 @@ def verify_topup_payment(payload: VerifyPaymentRequest, user_id: str = Depends(g
         }).execute()
     except Exception:
         pass
+
+    try:
+        send_notification(
+            owner_id=user_id,
+            title="Credits added",
+            body=f"{credits_to_add} credits were added to your account. New balance: {new_credits}.",
+            type="success",
+            action_label="View balance",
+            action_url="/ventures/raptor/dashboard.html",
+        )
+    except Exception as e:
+        log.error(f"Failed to send top-up notification for {user_id}: {e}")
 
     return {
         "status": "success",

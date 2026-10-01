@@ -1,7 +1,10 @@
+import logging
 import os
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
+
+log = logging.getLogger("raptor_auth")
 
 # Use real environment variables only -- no placeholder fallback strings.
 # A fake default like "YOUR_SUPABASE_PROJECT_URL" is not a valid URL, so
@@ -44,6 +47,39 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
+LOW_CREDITS_THRESHOLD = 10
+
+
+def _notify_credit_balance(user_id: str, credits_before: int, credits_after: int) -> None:
+    """Fires at most one notification per deduction, only when the balance
+    actually crosses a threshold (out-of-credits, or down into the low-
+    credits band) - never on every single deduction, which would spam the
+    bell. Best-effort: a failure here must never break the deduction itself,
+    which is why this is called from deduct_credit() inside its own
+    try/except rather than letting an exception propagate."""
+    from .notifications import send_notification
+
+    if credits_after <= 0 and credits_before > 0:
+        send_notification(
+            owner_id=user_id,
+            title="You're out of credits",
+            body="You've used all your Raptor credits. Top up or upgrade to keep using Pro tools.",
+            type="alert",
+            display_mode="banner",
+            action_label="Buy credits",
+            action_url="/ventures/raptor/pricing/",
+        )
+    elif credits_before > LOW_CREDITS_THRESHOLD >= credits_after:
+        send_notification(
+            owner_id=user_id,
+            title="Running low on credits",
+            body=f"You have {credits_after} credits left.",
+            type="warning",
+            action_label="Buy credits",
+            action_url="/ventures/raptor/pricing/",
+        )
+
+
 def deduct_credit(user_id: str, amount: int = 1) -> int:
     """Checks if the user has enough credits, deducts them, and returns the balance."""
     if not supabase:
@@ -65,5 +101,10 @@ def deduct_credit(user_id: str, amount: int = 1) -> int:
 
     # 3. Update the database
     supabase.table("raptor_users").update({"credits": new_credits}).eq("user_id", user_id).execute()
+
+    try:
+        _notify_credit_balance(user_id, current_credits, new_credits)
+    except Exception as e:
+        log.error(f"Failed to send credit-balance notification for {user_id}: {e}")
 
     return new_credits
