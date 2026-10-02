@@ -28,7 +28,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from raptor.utility.notifications import (
-    SYSTEM_FROM_EMAIL,
     SYSTEM_FROM_NAME,
     _notification_email_html,
 )
@@ -98,18 +97,29 @@ def _audit(org_id: str, actor_id: str, action: str, detail: dict) -> None:
 
 
 def _send_email(to_email: str, subject: str, title: str, body: str, label: str | None = None, url: str | None = None) -> None:
-    if not resend.api_key:
-        raise HTTPException(status_code=500, detail="Email sender is not configured on the server.")
+    # Key: the name notifications.py uses, or RESEND_API_KEY (what the license
+    # server uses). Sender: the address already proven to work on this Resend
+    # account's verified domain; override with TEAM_FROM_EMAIL if needed.
+    key = os.environ.get("RAPTOR_SYSTEM_RESEND_API_KEY") or os.environ.get("RESEND_API_KEY") or ""
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="no Resend API key is set on this server - add RESEND_API_KEY (or RAPTOR_SYSTEM_RESEND_API_KEY) in Render's Environment tab",
+        )
+    resend.api_key = key
+    sender = os.environ.get("TEAM_FROM_EMAIL") or "onboarding@shoonyaorigins.com"
     try:
         resend.Emails.send({
-            "from": f"{SYSTEM_FROM_NAME} <{SYSTEM_FROM_EMAIL}>",
+            "from": f"{SYSTEM_FROM_NAME} <{sender}>",
             "to": [to_email],
             "subject": subject,
             "html": _notification_email_html(title, body, label, url),
         })
     except Exception as err:
         log.error("email to %s failed: %s", to_email, err)
-        raise HTTPException(status_code=502, detail="Could not send the email. Please try again.")
+        # Resend's own message (e.g. "domain is not verified") is what the
+        # owner needs to see - it contains no secrets.
+        raise HTTPException(status_code=502, detail=f"the email provider rejected it: {str(err)[:200]}")
 
 
 def _clean_permissions(raw: dict | None) -> dict:
@@ -221,9 +231,9 @@ def _adopt_existing_account(sb, org_id: str, caller_id: str, email: str, permiss
             email, "You've been invited to Raptor", "You've been invited to join a Raptor team",
             "Use this link to sign in, set a new password, and join the team.", "Accept invitation", link.properties.action_link,
         )
-    except HTTPException:
+    except HTTPException as mail_err:
         _audit(org_id, caller_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": False, "converted_existing_account": True})
-        raise HTTPException(status_code=502, detail="Member added, but the invitation email could not be sent. Use Resend on their row.")
+        raise HTTPException(status_code=502, detail=f"Member added, but the invitation email could not be sent ({mail_err.detail}). Fix that, then use Resend on their row.")
 
     _audit(org_id, caller_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": True, "converted_existing_account": True})
     return {"ok": True, "user_id": uid, "converted": True}
@@ -290,10 +300,10 @@ def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
             email, "You've been invited to Raptor", "You've been invited to join a Raptor team",
             "Accept the invitation to set your password and get started.", "Accept invitation", link.properties.action_link,
         )
-    except HTTPException:
+    except HTTPException as mail_err:
         # Keep the member row so the owner can use "Resend invite".
         _audit(org_id, user_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": False})
-        raise HTTPException(status_code=502, detail="Member added, but the invitation email could not be sent. Use Resend invite.")
+        raise HTTPException(status_code=502, detail=f"Member added, but the invitation email could not be sent ({mail_err.detail}). Fix that, then use Resend on their row.")
 
     _audit(org_id, user_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": True})
     return {"ok": True, "user_id": new_user_id}
