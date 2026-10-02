@@ -118,6 +118,117 @@ def _clean_permissions(raw: dict | None) -> dict:
 
 # ---------------------------------------------------------------- invite ---
 
+# Everything that counts as "this login has real data of its own". Counts
+# rows owned by the login in each table; the auto-seeded pipeline stages and
+# system notifications are deliberately NOT here (an account that merely
+# opened the CRM once still counts as empty). Used credits don't count either.
+_OWNED_DATA_TABLES = [
+    ("contacts", "owner_id"), ("companies", "owner_id"), ("deals", "owner_id"),
+    ("interactions", "owner_id"), ("reminders", "owner_id"), ("calls", "owner_id"),
+    ("campaigns", "owner_id"), ("automations", "owner_id"), ("automation_runs", "owner_id"),
+    ("attachments", "owner_id"), ("custom_field_defs", "owner_id"),
+    ("email_accounts", "owner_id"), ("whatsapp_accounts", "owner_id"), ("ai_content_keys", "owner_id"),
+    ("pitches", "owner_id"), ("prospect_dossiers", "owner_id"), ("pipeline", "owner_id"),
+    ("competitors", "owner_id"), ("pattern_events", "owner_id"), ("system_dna", "owner_id"),
+    ("raptor_topups", "user_id"),
+]
+
+
+def _has_rows(sb, table: str, col: str, uid: str) -> bool:
+    try:
+        res = sb.table(table).select(col, count="exact").eq(col, uid).limit(1).execute()
+        return bool(res.count) or bool(res.data)
+    except Exception as err:
+        text = str(err).lower()
+        if "does not exist" in text or "could not find the table" in text or "pgrst205" in text or "42p01" in text:
+            return False  # table not created on this database - nothing to count
+        raise
+
+
+def _find_auth_user(sb, email: str):
+    for page in range(1, 21):
+        users = sb.auth.admin.list_users(page=page, per_page=1000)
+        for u in users:
+            if (u.email or "").lower() == email:
+                return u
+        if len(users) < 1000:
+            break
+    return None
+
+
+def _adopt_existing_account(sb, org_id: str, caller_id: str, email: str, permissions: dict, preset: str | None):
+    """The invited email already has a login. If that login is a one-person
+    organization with no data, no paid plan and no team of its own, turn it
+    into an employee of `org_id`; otherwise refuse with a specific reason."""
+    try:
+        target = _find_auth_user(sb, email)
+        if target is None:
+            raise HTTPException(status_code=502, detail="Could not look up that account. Please try again.")
+        uid = str(target.id)
+        if uid == caller_id:
+            raise HTTPException(status_code=400, detail="That's your own email address.")
+
+        member = sb.table("org_members").select("org_id,is_owner,status").eq("user_id", uid).limit(1).execute()
+        row = member.data[0] if member.data else None
+        if row and (row["org_id"] != uid or not row["is_owner"]):
+            raise HTTPException(status_code=409, detail="That person already belongs to another organization, so they can't be added to yours.")
+        if row and row["status"] != "active":
+            raise HTTPException(status_code=409, detail="That account has been removed from an organization and can't be added here.")
+
+        others = sb.table("org_members").select("id").eq("org_id", uid).neq("user_id", uid).limit(1).execute()
+        if others.data:
+            raise HTTPException(status_code=409, detail="That person runs their own team, so they can't be added to yours.")
+
+        plan = sb.table("raptor_users").select("plan").eq("user_id", uid).limit(1).execute()
+        if plan.data and (plan.data[0].get("plan") or "Free").lower() != "free":
+            raise HTTPException(status_code=409, detail="That account is on a paid plan, so it can't be converted. Ask them to use a different work email.")
+
+        for table, col in _OWNED_DATA_TABLES:
+            if _has_rows(sb, table, col, uid):
+                raise HTTPException(
+                    status_code=409,
+                    detail="That email already has a Raptor account with its own data, so it can't be added. Ask them to use a different work email.",
+                )
+    except HTTPException:
+        raise
+    except Exception as err:
+        log.error("adopt check failed for %s: %s", email, err)
+        raise HTTPException(status_code=502, detail="Could not check that account. Please try again.")
+
+    # Build the sign-in link FIRST - if that fails, nothing has been changed yet.
+    try:
+        link = sb.auth.admin.generate_link({"type": "magiclink", "email": email, "options": {"redirect_to": APP_URL}})
+    except Exception as err:
+        log.error("adopt generate_link failed: %s", err)
+        raise HTTPException(status_code=502, detail="Could not create the invitation.")
+
+    try:
+        # Deleting their one-person organization cascades away its owner
+        # membership row. If the insert below were to fail, they simply fall
+        # back to being a solo account again (no membership row = solo), so
+        # there is no state in which they lose access to their login.
+        sb.table("organizations").delete().eq("id", uid).execute()
+        sb.table("org_members").insert({
+            "org_id": org_id, "user_id": uid, "email": email, "is_owner": False,
+            "status": "invited", "preset": preset, "permissions": permissions, "invited_by": caller_id,
+        }).execute()
+    except Exception as err:
+        log.error("adopt switch failed for %s: %s", email, err)
+        raise HTTPException(status_code=500, detail="Could not add that person to your team.")
+
+    try:
+        _send_email(
+            email, "You've been invited to Raptor", "You've been invited to join a Raptor team",
+            "Use this link to sign in, set a new password, and join the team.", "Accept invitation", link.properties.action_link,
+        )
+    except HTTPException:
+        _audit(org_id, caller_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": False, "converted_existing_account": True})
+        raise HTTPException(status_code=502, detail="Member added, but the invitation email could not be sent. Use Resend on their row.")
+
+    _audit(org_id, caller_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": True, "converted_existing_account": True})
+    return {"ok": True, "user_id": uid, "converted": True}
+
+
 class InviteBody(BaseModel):
     email: str
     permissions: dict | None = None
@@ -133,6 +244,17 @@ def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Enter a valid email address.")
     permissions = _clean_permissions(body.permissions)
 
+    # Already on THIS team? Say so plainly instead of a generic error.
+    here = sb.table("org_members").select("status").eq("org_id", org_id).ilike("email", email).limit(1).execute()
+    if here.data:
+        state = here.data[0]["status"]
+        msg = {
+            "invited": "That person has already been invited. Use Resend on their row if the email didn't arrive.",
+            "active": "That person is already on your team.",
+            "removed": "That person was removed from your team. Re-adding a removed member isn't supported yet.",
+        }.get(state, "That person is already part of your team.")
+        raise HTTPException(status_code=409, detail=msg)
+
     try:
         link = sb.auth.admin.generate_link({
             "type": "invite",
@@ -140,13 +262,12 @@ def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
             "options": {"redirect_to": APP_URL, "data": {"invited_to_org": org_id}},
         })
     except Exception as err:
-        # Supabase refuses to invite an address that already has an account.
-        # That is exactly the "one person, one organization" rule.
+        # Supabase refuses to invite an address that already has a login.
+        # That login may be an empty one (someone who only ever clicked
+        # sign-up) - those can be converted into an employee account; a login
+        # that has real data of its own can't.
         if "already" in str(err).lower() or "registered" in str(err).lower() or "exists" in str(err).lower():
-            raise HTTPException(
-                status_code=409,
-                detail="That email already has a Raptor account, so it can't be added to another organization.",
-            )
+            return _adopt_existing_account(sb, org_id, user_id, email, permissions, body.preset)
         log.error("generate_link failed: %s", err)
         raise HTTPException(status_code=502, detail="Could not create the invitation.")
 
