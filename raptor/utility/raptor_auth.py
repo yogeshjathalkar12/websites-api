@@ -123,19 +123,22 @@ def _notify_credit_balance(user_id: str, credits_before: int, credits_after: int
         )
 
 
-def _billing_user_id(user_id: str) -> str:
+def _billing_user_id(user_id: str, require_owner: bool = False) -> str:
     """Whose credit balance a request is charged to. A member of an
     organization spends the ORGANIZATION's pool (the owner's raptor_users
     row, which is also the org id); a removed or not-yet-accepted member
     can't spend at all. Anyone without a membership row (a solo account, or
     a database where the organization tables haven't been created yet) is
-    charged to themselves exactly as before. Uses the service-role client
+    charged to themselves exactly as before. With require_owner=True (used
+    by payments) only the organization's current owner is accepted - which
+    is also what lets a transferred owner pay: the credit row stays keyed by
+    the organization id however ownership moves. Uses the service-role client
     because org_members has no client-readable policy for other users."""
     service_client = get_service_client()
     if not service_client:
         return user_id
     try:
-        res = service_client.table("org_members").select("org_id,status").eq("user_id", user_id).limit(1).execute()
+        res = service_client.table("org_members").select("org_id,status,is_owner").eq("user_id", user_id).limit(1).execute()
     except Exception:
         return user_id  # org tables not there yet - behave as a solo account
     if not res.data:
@@ -143,6 +146,8 @@ def _billing_user_id(user_id: str) -> str:
     row = res.data[0]
     if row["status"] != "active":
         raise HTTPException(status_code=403, detail="Your access to this organization is not active.")
+    if require_owner and not row.get("is_owner"):
+        raise HTTPException(status_code=403, detail="Only your organization's owner can change billing.")
     return row["org_id"]
 
 

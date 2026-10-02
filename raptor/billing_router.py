@@ -37,7 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 # Same shared auth/credit module every other tool router uses.
-from .utility.raptor_auth import get_current_user, supabase
+from .utility.raptor_auth import _billing_user_id, get_current_user, supabase
 from .utility.notifications import send_notification
 
 router = APIRouter()
@@ -102,6 +102,7 @@ def create_order(user_id: str = Depends(get_current_user)):
             status_code=500,
             detail="Payments are not configured on the server (missing RAZORPAY_KEY_ID/SECRET).",
         )
+    _billing_user_id(user_id, require_owner=True)  # members can't buy for the organization
 
     data = {
         "amount": PRO_PLAN_PRICE_PAISE,
@@ -145,12 +146,16 @@ def verify_payment(payload: VerifyPaymentRequest, user_id: str = Depends(get_cur
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Verification failed: {e}")
 
+    # The plan lives on the organization's credit row (keyed by the org id,
+    # which stays fixed even if ownership is transferred) - for a solo
+    # account that is simply the user's own row, exactly as before.
+    billing_id = _billing_user_id(user_id, require_owner=True)
     try:
         supabase.table("raptor_users").update({
             "plan": "Pro",
             "total_credits": PRO_PLAN_CREDITS,
             "credits": PRO_PLAN_CREDITS,
-        }).eq("user_id", user_id).execute()
+        }).eq("user_id", billing_id).execute()
     except Exception as e:
         # Signature is verified at this point -- the payment is real.
         # A DB write failure here needs a human to reconcile, not a
@@ -197,11 +202,12 @@ def create_topup_order(payload: CreateTopupOrderRequest, user_id: str = Depends(
     if not pack:
         raise HTTPException(status_code=400, detail="Unknown credit pack.")
 
+    billing_id = _billing_user_id(user_id, require_owner=True)
     try:
         user_row = (
             supabase.table("raptor_users")
             .select("plan")
-            .eq("user_id", user_id)
+            .eq("user_id", billing_id)
             .single()
             .execute()
         )
@@ -301,11 +307,12 @@ def verify_topup_payment(payload: VerifyPaymentRequest, user_id: str = Depends(g
 
     credits_to_add = pack["credits"]
 
+    billing_id = _billing_user_id(user_id, require_owner=True)
     try:
         user_row = (
             supabase.table("raptor_users")
             .select("credits, total_credits")
-            .eq("user_id", user_id)
+            .eq("user_id", billing_id)
             .single()
             .execute()
         )
@@ -325,7 +332,7 @@ def verify_topup_payment(payload: VerifyPaymentRequest, user_id: str = Depends(g
         supabase.table("raptor_users").update({
             "credits": new_credits,
             "total_credits": new_total,
-        }).eq("user_id", user_id).execute()
+        }).eq("user_id", billing_id).execute()
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -339,7 +346,7 @@ def verify_topup_payment(payload: VerifyPaymentRequest, user_id: str = Depends(g
     try:
         supabase.table("raptor_topups").insert({
             "payment_id": payload.razorpay_payment_id,
-            "user_id": user_id,
+            "user_id": billing_id,
             "credits": credits_to_add,
         }).execute()
     except Exception:

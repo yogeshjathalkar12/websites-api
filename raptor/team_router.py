@@ -47,7 +47,7 @@ router = APIRouter()
 APP_URL = "https://shoonyaorigins.com/ventures/raptor/app/"
 
 PERMISSION_KEYS = {"view_all", "create", "edit", "delete", "manage_pipeline", "manage_automations"}
-OTP_PURPOSES = {"export"}
+OTP_PURPOSES = {"export", "transfer"}   # transfer = handing over ownership
 OTP_TTL = timedelta(minutes=10)
 OTP_RESEND_COOLDOWN = timedelta(seconds=60)
 OTP_MAX_ATTEMPTS = 5
@@ -85,6 +85,41 @@ def _owner_org(user_id: str) -> str:
             detail="Only the organization owner can do this. If you are the owner, open Raptor once so your organization is set up.",
         )
     return res.data[0]["org_id"]
+
+
+def _admin_org(user_id: str) -> tuple[str, bool]:
+    """(org_id, is_owner) if `user_id` is an active owner OR admin, otherwise 403.
+    Admins run the team day to day; owner-only actions use _owner_org instead."""
+    res = (
+        _client().table("org_members").select("org_id,is_owner,is_admin")
+        .eq("user_id", user_id).eq("status", "active").limit(1).execute()
+    )
+    row = res.data[0] if res.data else None
+    if not row or not (row["is_owner"] or row.get("is_admin")):
+        raise HTTPException(
+            status_code=403,
+            detail="Only an organization owner or admin can do this. If you are the owner, open Raptor once so your organization is set up.",
+        )
+    return row["org_id"], bool(row["is_owner"])
+
+
+def _member_row(sb, org_id: str, target_id: str):
+    res = (
+        sb.table("org_members").select("user_id,email,status,is_owner,is_admin")
+        .eq("org_id", org_id).eq("user_id", target_id).limit(1).execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _consume_grant(sb, user_id: str, purpose: str) -> None:
+    """A verified emailed code (see /otp/verify) is good for one sensitive action."""
+    res = (
+        sb.table("step_up_grants").select("id,expires_at").eq("user_id", user_id).eq("purpose", purpose)
+        .order("expires_at", desc=True).limit(1).execute()
+    )
+    if not res.data or _parse_ts(res.data[0]["expires_at"]) < _now():
+        raise HTTPException(status_code=403, detail="Confirm with the emailed code first.")
+    sb.table("step_up_grants").delete().eq("id", res.data[0]["id"]).execute()
 
 
 def _audit(org_id: str, actor_id: str, action: str, detail: dict) -> None:
@@ -247,7 +282,7 @@ class InviteBody(BaseModel):
 
 @router.post("/invite")
 def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
-    org_id = _owner_org(user_id)
+    org_id, _ = _admin_org(user_id)
     sb = _client()
     email = body.email.strip().lower()
     if not _EMAIL_RE.match(email):
@@ -261,7 +296,7 @@ def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
         msg = {
             "invited": "That person has already been invited. Use Resend on their row if the email didn't arrive.",
             "active": "That person is already on your team.",
-            "removed": "That person was removed from your team. Re-adding a removed member isn't supported yet.",
+            "removed": "That person was removed from your team. Use Re-add on their row (under Removed members).",
         }.get(state, "That person is already part of your team.")
         raise HTTPException(status_code=409, detail=msg)
 
@@ -315,7 +350,7 @@ class UserBody(BaseModel):
 
 @router.post("/resend-invite")
 def resend_invite(body: UserBody, user_id: str = Depends(get_current_user)):
-    org_id = _owner_org(user_id)
+    org_id, _ = _admin_org(user_id)
     sb = _client()
     res = (
         sb.table("org_members").select("email,status")
@@ -352,10 +387,15 @@ def remove_member(body: RemoveBody, user_id: str = Depends(get_current_user)):
     next query returns nothing no matter how long their token has left. The
     ban and session purge after it are belt-and-braces so they also cannot
     sign in or refresh again."""
-    org_id = _owner_org(user_id)
+    org_id, caller_is_owner = _admin_org(user_id)
     sb = _client()
     if body.user_id == user_id:
-        raise HTTPException(status_code=400, detail="The owner can't be removed.")
+        raise HTTPException(status_code=400, detail="You can't remove yourself.")
+    target = _member_row(sb, org_id, body.user_id)
+    if target and target["is_owner"]:
+        raise HTTPException(status_code=400, detail="The owner can't be removed. Transfer ownership first.")
+    if target and target.get("is_admin") and not caller_is_owner:
+        raise HTTPException(status_code=403, detail="Only the owner can remove an admin.")
 
     try:
         result = sb.rpc("offboard_member", {
@@ -432,7 +472,8 @@ def otp_send(body: OtpSendBody, user_id: str = Depends(get_current_user)):
     }).execute()
 
     _send_email(
-        email, "Your Raptor verification code", "Confirm your data export",
+        email, "Your Raptor verification code",
+        "Confirm your data export" if body.purpose == "export" else "Confirm handing over ownership",
         f"Your verification code is <strong style=\"color:#fff;font-size:22px;letter-spacing:4px;\">{code}</strong>. "
         "It expires in 10 minutes. If you didn't request this, someone may be using your open session - sign out and change your password.",
     )
@@ -473,3 +514,91 @@ def otp_verify(body: OtpVerifyBody, user_id: str = Depends(get_current_user)):
     }).execute()
     _audit(org_id, user_id, "otp_verified", {"purpose": body.purpose})
     return {"ok": True, "valid_for": int(GRANT_TTL.total_seconds())}
+
+
+# ------------------------------------------------- re-add / transfer / 2FA ---
+
+@router.post("/reinstate")
+def reinstate_member(body: UserBody, user_id: str = Depends(get_current_user)):
+    """Bring a removed member back. They return as 'invited' (with their old
+    permissions, no manager, not an admin) and must accept by clicking the
+    emailed link - nothing about the old removal is silently undone."""
+    org_id, _ = _admin_org(user_id)
+    sb = _client()
+    target = _member_row(sb, org_id, body.user_id)
+    if not target or target["status"] != "removed":
+        raise HTTPException(status_code=404, detail="That person is not a removed member of your team.")
+    try:
+        sb.auth.admin.update_user_by_id(body.user_id, {"ban_duration": "none"})
+    except Exception as err:
+        log.error("unban failed for %s: %s", body.user_id, err)
+        raise HTTPException(status_code=502, detail="Could not re-enable their login. Please try again.")
+    try:
+        sb.rpc("reinstate_member", {"p_org": org_id, "p_user": body.user_id, "p_actor": user_id}).execute()
+    except Exception as err:
+        raise HTTPException(status_code=400, detail=getattr(err, "message", None) or str(err))
+    try:
+        link = sb.auth.admin.generate_link({"type": "magiclink", "email": target["email"], "options": {"redirect_to": APP_URL}})
+        _send_email(
+            target["email"], "You're back on the team", "You've been added back to your Raptor team",
+            "Click the button to accept and rejoin the team. No password needed.", "Rejoin the team", link.properties.action_link,
+        )
+    except HTTPException as mail_err:
+        raise HTTPException(status_code=502, detail="They are re-added, but the email could not be sent (" + str(mail_err.detail) + "). Use Resend on their row.")
+    except Exception as err:
+        log.error("reinstate link failed: %s", err)
+        raise HTTPException(status_code=502, detail="They are re-added, but the sign-in link could not be created. Use Resend on their row.")
+    return {"ok": True}
+
+
+class TransferBody(BaseModel):
+    user_id: str
+
+
+@router.post("/transfer-ownership")
+def transfer_ownership(body: TransferBody, user_id: str = Depends(get_current_user)):
+    """Owner hands the organization to another ACTIVE member. Owner only, and
+    only straight after confirming an emailed code (purpose 'transfer') - this
+    is the most powerful action in the product. The previous owner becomes an
+    admin so nobody is left without access. Billing follows automatically: the
+    organization's plan lives on a row keyed by the organization id, which
+    never changes."""
+    org_id = _owner_org(user_id)
+    sb = _client()
+    if body.user_id == user_id:
+        raise HTTPException(status_code=400, detail="You already own this organization.")
+    target = _member_row(sb, org_id, body.user_id)
+    if not target or target["status"] != "active":
+        raise HTTPException(status_code=400, detail="Ownership can only go to an active member of your team.")
+    _consume_grant(sb, user_id, "transfer")
+    try:
+        sb.rpc("transfer_ownership", {"p_org": org_id, "p_from": user_id, "p_to": body.user_id}).execute()
+    except Exception as err:
+        raise HTTPException(status_code=400, detail=getattr(err, "message", None) or str(err))
+    return {"ok": True}
+
+
+@router.post("/reset-mfa")
+def reset_member_mfa(body: UserBody, user_id: str = Depends(get_current_user)):
+    """A member lost their phone: remove their authenticator so they can set up
+    a new one. Admins can do this for ordinary members; only the owner can for
+    an admin. The owner's own two-factor can only be reset from the Supabase
+    dashboard (there is nobody above them to approve it)."""
+    org_id, caller_is_owner = _admin_org(user_id)
+    sb = _client()
+    target = _member_row(sb, org_id, body.user_id)
+    if not target or target["status"] == "removed":
+        raise HTTPException(status_code=404, detail="That person is not on your team.")
+    if target["is_owner"]:
+        raise HTTPException(status_code=403, detail="The owner's two-factor can only be reset from the Supabase dashboard.")
+    if target.get("is_admin") and not caller_is_owner:
+        raise HTTPException(status_code=403, detail="Only the owner can reset an admin's two-factor.")
+    try:
+        factors = sb.auth.admin.mfa.list_factors({"user_id": body.user_id})
+        for f in factors:
+            sb.auth.admin.mfa.delete_factor({"id": f.id, "user_id": body.user_id})
+    except Exception as err:
+        log.error("mfa reset failed for %s: %s", body.user_id, err)
+        raise HTTPException(status_code=502, detail="Could not reset their two-factor. Please try again.")
+    _audit(org_id, user_id, "two_factor_reset", {"user_id": body.user_id, "email": target["email"]})
+    return {"ok": True, "removed": len(factors)}
