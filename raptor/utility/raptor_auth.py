@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 import os
 from fastapi import HTTPException, Depends
@@ -25,6 +27,47 @@ supabase: Client = (
 )
 
 security = HTTPBearer()
+
+
+def _key_role(key: str):
+    """Reads the `role` claim out of a Supabase JWT key ('anon' or
+    'service_role') without verifying it - it's only used to refuse the wrong
+    kind of key, not to trust anything."""
+    try:
+        payload = key.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role")
+    except Exception:
+        return None
+
+
+def _is_service_key(key) -> bool:
+    return bool(key) and (key.startswith("sb_secret_") or _key_role(key) == "service_role")
+
+
+_service_client = None
+
+
+def get_service_client():
+    """A Supabase client holding the SERVICE-ROLE key (bypasses row-level
+    security), or None if the server has none configured.
+
+    Looks in SUPABASE_SERVICE_ROLE_KEY first, then SUPABASE_KEY - this app's
+    other routers have always read the service key from SUPABASE_KEY, so a
+    deployment configured the old way keeps working. A key is only accepted if
+    its role claim says service_role, so a public/anon key sitting in either
+    variable is never silently used for admin work."""
+    global _service_client
+    if _service_client is not None:
+        return _service_client
+    if not SUPABASE_URL:
+        return None
+    for name in ("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY"):
+        key = os.getenv(name)
+        if _is_service_key(key):
+            _service_client = create_client(SUPABASE_URL, key)
+            return _service_client
+    return None
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
@@ -88,8 +131,7 @@ def _billing_user_id(user_id: str) -> str:
     a database where the organization tables haven't been created yet) is
     charged to themselves exactly as before. Uses the service-role client
     because org_members has no client-readable policy for other users."""
-    from .notifications import _supabase as service_client
-
+    service_client = get_service_client()
     if not service_client:
         return user_id
     try:

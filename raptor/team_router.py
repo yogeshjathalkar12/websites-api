@@ -26,23 +26,22 @@ from datetime import datetime, timedelta, timezone
 import resend
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from supabase import create_client
 
 from raptor.utility.notifications import (
     SYSTEM_FROM_EMAIL,
     SYSTEM_FROM_NAME,
     _notification_email_html,
 )
-from raptor.utility.raptor_auth import get_current_user
+from raptor.utility.raptor_auth import get_current_user, get_service_client
 
 log = logging.getLogger("raptor_team")
 router = APIRouter()
 
-# Same graceful-degradation pattern as raptor_auth.py / notifications.py: a
-# missing env var must not stop the whole multi-venture hub from booting.
-_SUPABASE_URL = os.environ.get("SUPABASE_URL")
-_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-_sb = create_client(_SUPABASE_URL, _SERVICE_KEY) if _SUPABASE_URL and _SERVICE_KEY else None
+# The service-role client comes from raptor_auth.get_service_client(), which
+# accepts the key under SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY (the name
+# this app's other routers use) and refuses a key that isn't service_role.
+# Resolved per request, not at import, so a missing key never stops the whole
+# multi-venture hub from booting.
 
 # Must be on Supabase's Redirect URLs allow-list (it already is: the signup
 # form uses it as emailRedirectTo).
@@ -58,9 +57,13 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _client():
-    if not _sb:
-        raise HTTPException(status_code=500, detail="Server is missing Supabase service credentials.")
-    return _sb
+    sb = get_service_client()
+    if not sb:
+        raise HTTPException(
+            status_code=500,
+            detail="The server has no Supabase service-role key. Set SUPABASE_SERVICE_ROLE_KEY (or put the service_role key in SUPABASE_KEY) on Render.",
+        )
+    return sb
 
 
 def _now() -> datetime:
@@ -258,7 +261,12 @@ class OtpVerifyBody(BaseModel):
 
 
 def _otp_hash(user_id: str, purpose: str, code: str) -> str:
-    secret = (os.environ.get("OTP_HMAC_SECRET") or _SERVICE_KEY or "").encode()
+    secret = (
+        os.environ.get("OTP_HMAC_SECRET")
+        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_KEY")
+        or ""
+    ).encode()
     return hmac.new(secret, f"{user_id}:{purpose}:{code}".encode(), hashlib.sha256).hexdigest()
 
 
