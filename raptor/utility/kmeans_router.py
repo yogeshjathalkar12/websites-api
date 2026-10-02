@@ -176,9 +176,15 @@ def cluster(background_tasks: BackgroundTasks, payload: dict = Body(...), user_i
     # Credit is deducted up front, synchronously -- the user shouldn't be
     # able to queue free jobs by walking away before a background task
     # would otherwise have deducted it.
-    remaining_credits = deduct_credit(user_id)
-
+    # Create the job BEFORE charging: if the jobs table is unavailable the
+    # request fails without costing the person a credit. If they turn out to
+    # have no credits, the unused job is removed again.
     job_id = compute_jobs.create_job(user_id, "kmeans", {"row_count": len(rows), "fields": fields, "k": k})
+    try:
+        remaining_credits = deduct_credit(user_id)
+    except Exception:
+        compute_jobs.delete_job(job_id)
+        raise
     background_tasks.add_task(_execute_cluster_job, job_id, user_id, rows, fields, k, label_field)
 
     return {"job_id": job_id, "status": "queued", "credits_left": remaining_credits}

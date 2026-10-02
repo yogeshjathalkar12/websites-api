@@ -58,7 +58,7 @@ def _geocode(place_text: str):
     resp.raise_for_status()
     results = resp.json()
     if not results:
-        raise HTTPException(status_code=404, detail=f"Could not geocode '{place_text}'.")
+        raise HTTPException(status_code=404, detail=f"Couldn't find a place called '{place_text}'. Try adding the country, e.g. 'Pune, India'.")
 
     lat, lng = float(results[0]["lat"]), float(results[0]["lon"])
     resolved_name = results[0].get("display_name", place_text)
@@ -111,9 +111,15 @@ def resolve_send_time(payload: dict = Body(...), user_id: str = Depends(get_curr
     except Exception:
         raise HTTPException(status_code=400, detail="target_local_time must be 'HH:MM'.")
 
-    remaining_credits = deduct_credit(user_id)
-
-    lat, lng, resolved_name = _geocode(place)
+    # Do all the work that can fail FIRST (place lookup, timezone, date) and
+    # charge only once there is an answer to give - an unknown place or a busy
+    # map service shouldn't cost a credit.
+    try:
+        lat, lng, resolved_name = _geocode(place)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="The place-lookup service is busy right now. Please try again in a moment.")
     tz_name = _resolve_timezone(lat, lng)
     tzinfo = ZoneInfo(tz_name)
 
@@ -124,6 +130,8 @@ def resolve_send_time(payload: dict = Body(...), user_id: str = Depends(get_curr
             raise HTTPException(status_code=400, detail="target_date must be 'YYYY-MM-DD'.")
     else:
         target_date = (datetime.now(tzinfo) ).date()
+
+    remaining_credits = deduct_credit(user_id)
 
     local_dt = datetime.combine(target_date, dtime(hour, minute), tzinfo=tzinfo)
     utc_dt = local_dt.astimezone(ZoneInfo("UTC"))

@@ -53,9 +53,15 @@ def _open_mailbox(host: str, port: int, username: str, password: str) -> imaplib
         conn.login(username, password)
         return conn
     except imaplib.IMAP4.error as e:
-        raise HTTPException(status_code=401, detail=f"IMAP login failed: {e}")
+        # NOT 401: the app treats any 401 as "your Raptor session expired",
+        # retries the request (charging again) and signs the user out. A wrong
+        # mailbox password is a bad request, not an expired session.
+        raise HTTPException(
+            status_code=400,
+            detail="Your mailbox didn't accept that username or app password. Use an app-specific password (not your normal one) and check the mail server address.",
+        )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach mail server: {e}")
+        raise HTTPException(status_code=502, detail="Could not reach that mail server. Check the server address and port.")
 
 
 @router.get("/status")
@@ -84,10 +90,11 @@ def scan_threads(payload: dict = Body(...), user_id: str = Depends(get_current_u
     if not all([host, username, app_password]):
         raise HTTPException(status_code=400, detail="imap_host, username, and app_password are required.")
 
-    remaining_credits = deduct_credit(user_id)
-
+    # Log in FIRST and only charge once the mailbox actually opened, so a typo'd
+    # password or server address costs nothing.
     conn = _open_mailbox(host, port, username, app_password)
     try:
+        remaining_credits = deduct_credit(user_id)
         status_code, _ = conn.select(mailbox, readonly=True)
         if status_code != "OK":
             raise HTTPException(status_code=400, detail=f"Could not open mailbox '{mailbox}'.")

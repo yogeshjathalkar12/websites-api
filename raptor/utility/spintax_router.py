@@ -276,7 +276,6 @@ def compile_and_queue(payload: dict = Body(...), user_id: str = Depends(get_curr
 
     # --- No recipients: preserve the original unaddressed-queue behavior ---
     if not recipients_input:
-        remaining_credits = deduct_credit(user_id, amount=len(variants))
         rows = []
         seen_hashes = set()
         for v in variants:
@@ -290,6 +289,11 @@ def compile_and_queue(payload: dict = Body(...), user_id: str = Depends(get_curr
                 "variant_text": v,
                 "variant_hash": h,
             })
+        # Charge for the UNIQUE variants actually queued (the page promises
+        # "1 credit per unique variant"), not the raw permutation count - a
+        # template like {Hi|Hi|Hello} produces 3 permutations but only 2
+        # different emails.
+        remaining_credits = deduct_credit(user_id, amount=len(rows))
         if supabase and rows:
             try:
                 supabase.table("outreach_queue").upsert(rows, on_conflict="user_id,variant_hash").execute()

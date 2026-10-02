@@ -109,8 +109,16 @@ def upload_ranges(payload: dict = Body(...), user_id: str = Depends(get_current_
 @router.get("/resolve")
 def resolve_ip(ip: str, user_id: str = Depends(get_current_user)):
     """Resolves a single IP against the caller's own uploaded CIDR table."""
-    remaining_credits = deduct_credit(user_id)
+    # Reject a malformed address before charging for it.
+    try:
+        ipaddress.ip_address(ip.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="That doesn't look like an IP address. Enter something like 203.0.113.42.")
+    ip = ip.strip()
     ranges = _load_ranges(user_id)
+    if not ranges:
+        raise HTTPException(status_code=400, detail="You haven't added any company IP ranges yet. Add some first, then look an address up.")
+    remaining_credits = deduct_credit(user_id)
     company = _resolve_ip(ip, ranges)
 
     if supabase:

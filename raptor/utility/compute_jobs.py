@@ -40,6 +40,16 @@ def create_job(user_id: str, tool: str, input_payload: dict) -> str:
     return resp.data[0]["id"]
 
 
+def delete_job(job_id: str) -> None:
+    """Best-effort cleanup of a job that was created but never started (e.g.
+    the person turned out to have no credits left)."""
+    if supabase:
+        try:
+            supabase.table("compute_jobs").delete().eq("id", job_id).execute()
+        except Exception:
+            pass
+
+
 def mark_running(job_id: str) -> None:
     if supabase:
         supabase.table("compute_jobs").update({"status": "running"}).eq("id", job_id).execute()
@@ -66,14 +76,15 @@ def mark_failed(job_id: str, error: str) -> None:
 def get_job(user_id: str, job_id: str) -> dict:
     if not supabase:
         raise HTTPException(status_code=500, detail="Database credentials missing on server.")
+    # .limit(1) rather than .single(): a missing row is a plain 404, not a 500.
     resp = (
         supabase.table("compute_jobs")
         .select("*")
         .eq("id", job_id)
         .eq("user_id", user_id)
-        .single()
+        .limit(1)
         .execute()
     )
     if not resp.data:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return resp.data
+    return resp.data[0]

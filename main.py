@@ -11,6 +11,7 @@ from raptor.raptor_router import router as raptor_router
 from raptor.relay_router import router as raptor_relay_router
 from raptor.utility.chronos_router import router as chronos_router
 from raptor.utility.kmeans_router import router as kmeans_router
+from raptor.utility.diagnostic_router import router as diagnostic_router
 from raptor.utility.montecarlo_router import router as montecarlo_router
 from raptor.utility.resolver_router import router as resolver_router
 from raptor.utility.spintax_router import router as spintax_router
@@ -111,6 +112,7 @@ app.include_router(raptor_router, prefix="/api/raptor", tags=["Raptor"])
 # touches the desktop's local DNA/Pattern data - pure connectivity.
 app.include_router(raptor_relay_router, prefix="/api/raptor", tags=["Raptor - Mobile Relay"])
 app.include_router(chronos_router, prefix="/api/raptor/chronos", tags=["Raptor - Chronos"])
+app.include_router(diagnostic_router, prefix="/api/raptor/diagnostic", tags=["Raptor - Deliverability Diagnostics"])
 app.include_router(kmeans_router, prefix="/api/raptor/kmeans", tags=["Raptor - K-Means"])
 app.include_router(montecarlo_router, prefix="/api/raptor/montecarlo", tags=["Raptor - Monte Carlo"])
 app.include_router(resolver_router, prefix="/api/raptor/resolver", tags=["Raptor - IP Resolver"])

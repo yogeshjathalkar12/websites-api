@@ -153,9 +153,13 @@ def simulate(background_tasks: BackgroundTasks, payload: dict = Body(...), user_
             raise HTTPException(status_code=400, detail=f"Deal value cannot be negative: {d}")
         deals.append({"name": d.get("name", "Unnamed deal"), "value": value, "probability": probability})
 
-    remaining_credits = deduct_credit(user_id)
-
+    # Job first, charge second - see kmeans_router.cluster for why.
     job_id = compute_jobs.create_job(user_id, "montecarlo", {"deal_count": len(deals), "iterations": iterations})
+    try:
+        remaining_credits = deduct_credit(user_id)
+    except Exception:
+        compute_jobs.delete_job(job_id)
+        raise
     background_tasks.add_task(_execute_simulation_job, job_id, user_id, deals, iterations, bucket_count)
 
     return {"job_id": job_id, "status": "queued", "credits_left": remaining_credits}
