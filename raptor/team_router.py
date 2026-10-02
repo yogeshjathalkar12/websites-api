@@ -229,7 +229,7 @@ def _adopt_existing_account(sb, org_id: str, caller_id: str, email: str, permiss
     try:
         _send_email(
             email, "You've been invited to Raptor", "You've been invited to join a Raptor team",
-            "Use this link to sign in, set a new password, and join the team.", "Accept invitation", link.properties.action_link,
+            "Click the button to accept the invitation and join the team. No password needed.", "Accept invitation", link.properties.action_link,
         )
     except HTTPException as mail_err:
         _audit(org_id, caller_id, "member_invited", {"email": email, "permissions": permissions, "email_sent": False, "converted_existing_account": True})
@@ -298,7 +298,7 @@ def invite_member(body: InviteBody, user_id: str = Depends(get_current_user)):
     try:
         _send_email(
             email, "You've been invited to Raptor", "You've been invited to join a Raptor team",
-            "Accept the invitation to set your password and get started.", "Accept invitation", link.properties.action_link,
+            "Click the button to accept the invitation and join the team. No password needed.", "Accept invitation", link.properties.action_link,
         )
     except HTTPException as mail_err:
         # Keep the member row so the owner can use "Resend invite".
@@ -331,7 +331,7 @@ def resend_invite(body: UserBody, user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=502, detail="Could not create a new invitation link.")
     _send_email(
         email, "Your Raptor invitation", "Your Raptor invitation",
-        "Use this link to sign in, set your password, and join the team.", "Open Raptor", link.properties.action_link,
+        "Click the button to sign in and join the team. No password needed.", "Open Raptor", link.properties.action_link,
     )
     _audit(org_id, user_id, "invite_resent", {"email": email})
     return {"ok": True}
