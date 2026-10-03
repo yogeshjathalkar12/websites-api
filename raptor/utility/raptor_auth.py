@@ -151,6 +151,34 @@ def _billing_user_id(user_id: str, require_owner: bool = False) -> str:
     return row["org_id"]
 
 
+PRO_REQUIRED_MESSAGE = "This is part of the Pro plan. Upgrade to Pro to use it."
+
+
+def require_pro(user_id: str, message: str = PRO_REQUIRED_MESSAGE) -> None:
+    """Raises 403 unless the caller's ORGANIZATION is on the Pro plan.
+
+    Read on the server from raptor_users.plan (the row billing writes), for the
+    organization's billing row - so a team member counts as Pro when their
+    owner is, and a removed member is refused. If the plan can't be read the
+    answer is no, never "probably fine". This is the real lock; the screens
+    that show "Upgrade to Pro" are only the friendly half."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database credentials missing on server.")
+    billing_id = _billing_user_id(user_id)
+    try:
+        rows = supabase.table("raptor_users").select("plan").eq("user_id", billing_id).limit(1).execute().data or []
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not verify your plan right now. Please try again.")
+    if str((rows[0] if rows else {}).get("plan") or "Free").lower() != "pro":
+        raise HTTPException(status_code=403, detail=message)
+
+
+def pro_required(user_id: str = Depends(get_current_user)) -> str:
+    """Route dependency: `@router.post(..., dependencies=[Depends(pro_required)])`."""
+    require_pro(user_id)
+    return user_id
+
+
 def deduct_credit(user_id: str, amount: int = 1) -> int:
     """Checks if the user has enough credits, deducts them, and returns the balance."""
     if not supabase:

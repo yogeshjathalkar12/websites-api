@@ -47,7 +47,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Depends, Body, Request, Header
 from fastapi.responses import HTMLResponse, Response, RedirectResponse
 
-from raptor.utility.raptor_auth import get_current_user, supabase
+from raptor.utility.raptor_auth import get_current_user, supabase, pro_required, require_pro
 from . import key_vault
 from . import providers
 from . import tracking
@@ -183,19 +183,9 @@ PRO_MESSAGE = ("Email automation is part of the Pro plan. Upgrade to Pro to conn
 
 
 def _require_pro(user_id: str) -> None:
-    """Connecting a mailbox is a Pro feature. Read from raptor_users.plan,
-    the same place billing writes it (billing_router.py), on the server, so
-    it can't be bypassed from the browser. If the plan can't be verified
-    the answer is no, not "probably fine"."""
-    try:
-        rows = (
-            supabase.table('raptor_users').select('plan').eq('user_id', user_id).limit(1).execute().data
-        ) or []
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not verify your plan right now. Please try again.")
-    plan = str((rows[0] if rows else {}).get('plan') or 'Free')
-    if plan.lower() != 'pro':
-        raise HTTPException(status_code=403, detail=PRO_MESSAGE)
+    """Connecting a mailbox is a Pro feature - checked on the server for the
+    organization's plan (shared check in raptor_auth.require_pro)."""
+    require_pro(user_id, PRO_MESSAGE)
 
 
 RISKS_MESSAGE = ("Please confirm the statement about your responsibilities before connecting. "
@@ -466,7 +456,7 @@ def _send_one_batch(campaign_id: str) -> dict:
         _release_lock(campaign_id)
 
 
-@router.post("/campaigns/{campaign_id}/send")
+@router.post("/campaigns/{campaign_id}/send", dependencies=[Depends(pro_required)])
 def trigger_send(campaign_id: str, user_id: str = Depends(get_current_user)):
     campaign = supabase.table('email_campaigns').select('*, email_accounts(owner_id)').eq('id', campaign_id).single().execute().data
     if not campaign:
@@ -476,7 +466,7 @@ def trigger_send(campaign_id: str, user_id: str = Depends(get_current_user)):
     return _send_one_batch(campaign_id)
 
 
-@router.post("/campaigns/{campaign_id}/ab-test/declare-winner")
+@router.post("/campaigns/{campaign_id}/ab-test/declare-winner", dependencies=[Depends(pro_required)])
 def declare_ab_test_winner(campaign_id: str, user_id: str = Depends(get_current_user)):
     """Manual override — bypasses ab_test_duration_hours and picks a
     winner right now using the same logic the cron sweep uses (primary
@@ -621,7 +611,7 @@ def followup_tick():
 # Sequences — enrollment + the cron that walks steps forward
 # ---------------------------------------------------------------------------
 
-@router.post("/sequences/{sequence_id}/enroll")
+@router.post("/sequences/{sequence_id}/enroll", dependencies=[Depends(pro_required)])
 def enroll_in_sequence(sequence_id: str, payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Enroll by explicit email list, by audience tag, or both. Sequence
     definition (email_sequences / email_sequence_steps rows) is created
@@ -676,7 +666,7 @@ def ab_test_tick():
 # real send it was missing.
 # ---------------------------------------------------------------------------
 
-@router.post("/crm/dispatch")
+@router.post("/crm/dispatch", dependencies=[Depends(pro_required)])
 def crm_dispatch(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Resolves a CRM audience_list's filter against the CRM's own
     contacts table, provisions matching people as email_contacts under

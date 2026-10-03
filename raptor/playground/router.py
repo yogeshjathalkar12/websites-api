@@ -20,7 +20,7 @@ for a v1; not a place to over-build before anyone's used it once.
 """
 from fastapi import APIRouter, HTTPException, Depends, Body
 
-from raptor.utility.raptor_auth import get_current_user, supabase
+from raptor.utility.raptor_auth import get_current_user, pro_required, supabase
 from raptor.ai_integration import key_vault
 from raptor.ai_integration.providers import call_text, ProviderError, PROVIDER_CAPABILITIES
 
@@ -57,7 +57,7 @@ def status():
     return {"tool": "ai-playground", "status": "operational"}
 
 
-@router.post("/sessions")
+@router.post("/sessions", dependencies=[Depends(pro_required)])
 def create_session(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """
     Body: {
@@ -107,7 +107,7 @@ def create_session(payload: dict = Body(...), user_id: str = Depends(get_current
     return resp.data[0]
 
 
-@router.get("/sessions")
+@router.get("/sessions", dependencies=[Depends(pro_required)])
 def list_sessions(user_id: str = Depends(get_current_user)):
     resp = (
         supabase.table('playground_sessions')
@@ -120,7 +120,7 @@ def list_sessions(user_id: str = Depends(get_current_user)):
     return {"sessions": resp.data or []}
 
 
-@router.get("/sessions/{session_id}/messages")
+@router.get("/sessions/{session_id}/messages", dependencies=[Depends(pro_required)])
 def get_messages(session_id: str, user_id: str = Depends(get_current_user)):
     session = supabase.table('playground_sessions').select('id').eq('id', session_id).eq('user_id', user_id).single().execute().data
     if not session:
@@ -129,7 +129,7 @@ def get_messages(session_id: str, user_id: str = Depends(get_current_user)):
     return {"messages": resp.data or []}
 
 
-@router.post("/sessions/{session_id}/messages")
+@router.post("/sessions/{session_id}/messages", dependencies=[Depends(pro_required)])
 def send_message(session_id: str, payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Body: {"message": "..."}"""
     user_message = (payload.get('message') or '').strip()

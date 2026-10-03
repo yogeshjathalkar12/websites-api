@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Depends, Body, Request, Header
 from fastapi.responses import PlainTextResponse
 
-from raptor.utility.raptor_auth import get_current_user, supabase
+from raptor.utility.raptor_auth import get_current_user, supabase, pro_required
 from . import key_vault
 from . import flow_engine
 from .providers import get_provider
@@ -58,7 +58,7 @@ def status():
     return {"tool": "whatsapp-automation", "status": "operational"}
 
 
-@router.post("/accounts")
+@router.post("/accounts", dependencies=[Depends(pro_required)])
 def create_account(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     required = ['label', 'phone_number_id', 'waba_id', 'access_token']
     missing = [f for f in required if not str(payload.get(f, '')).strip()]
@@ -283,7 +283,7 @@ def _send_broadcast_batch(broadcast_id: str) -> dict:
         _release_lock('whatsapp_broadcasts', broadcast_id)
 
 
-@router.post("/broadcasts/{broadcast_id}/send")
+@router.post("/broadcasts/{broadcast_id}/send", dependencies=[Depends(pro_required)])
 def trigger_broadcast(broadcast_id: str, user_id: str = Depends(get_current_user)):
     broadcast = supabase.table('whatsapp_broadcasts').select('*, whatsapp_accounts(owner_id)').eq('id', broadcast_id).single().execute().data
     if not broadcast:
@@ -297,7 +297,7 @@ def trigger_broadcast(broadcast_id: str, user_id: str = Depends(get_current_user
 # Sequences
 # ---------------------------------------------------------------------------
 
-@router.post("/sequences/{sequence_id}/enroll")
+@router.post("/sequences/{sequence_id}/enroll", dependencies=[Depends(pro_required)])
 def enroll_contacts(sequence_id: str, payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Body: {"contact_ids": ["...", "..."]}"""
     sequence = supabase.table('whatsapp_sequences').select('*, whatsapp_accounts(owner_id)').eq('id', sequence_id).single().execute().data
@@ -372,7 +372,7 @@ def _advance_due_enrollments() -> dict:
 # Manual reply from the CRM ContactPanel (Phase 1)
 # ---------------------------------------------------------------------------
 
-@router.post("/reply")
+@router.post("/reply", dependencies=[Depends(pro_required)])
 def send_manual_reply(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Body: {"account_id": "...", "phone": "...", "text": "..."}
 

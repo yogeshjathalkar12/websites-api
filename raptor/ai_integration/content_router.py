@@ -37,7 +37,7 @@ import concurrent.futures
 
 from fastapi import APIRouter, HTTPException, Depends, Body
 
-from raptor.utility.raptor_auth import get_current_user, supabase
+from raptor.utility.raptor_auth import get_current_user, supabase, pro_required
 from . import key_vault
 from .rate_limit import check_rate_limit
 from .providers import (
@@ -127,7 +127,7 @@ def get_templates():
 # (see _resolve_step below). Costs one text call on the user's own key.
 # ---------------------------------------------------------------------------
 
-@router.post("/draft")
+@router.post("/draft", dependencies=[Depends(pro_required)])
 def draft_prompt(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """
     Body: {
@@ -177,7 +177,7 @@ def draft_prompt(payload: dict = Body(...), user_id: str = Depends(get_current_u
 # Key management
 # ---------------------------------------------------------------------------
 
-@router.post("/keys")
+@router.post("/keys", dependencies=[Depends(pro_required)])
 def add_key(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """Body: {"provider": "openai", "api_key": "sk-..."}"""
     provider = (payload.get("provider") or "").strip().lower()
@@ -186,12 +186,12 @@ def add_key(payload: dict = Body(...), user_id: str = Depends(get_current_user))
     return {"provider": provider, "capabilities": capabilities}
 
 
-@router.get("/keys")
+@router.get("/keys", dependencies=[Depends(pro_required)])
 def get_keys(user_id: str = Depends(get_current_user)):
     return {"keys": key_vault.list_keys(user_id), "known_providers": PROVIDER_CAPABILITIES}
 
 
-@router.delete("/keys/{provider}")
+@router.delete("/keys/{provider}", dependencies=[Depends(pro_required)])
 def remove_key(provider: str, user_id: str = Depends(get_current_user)):
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Unsupported provider '{provider}'.")
@@ -264,7 +264,7 @@ def _run_agents(modality: str, prompt: str, providers: list, api_keys: dict) -> 
         return dict(ex.map(_one, providers))
 
 
-@router.post("/pipeline")
+@router.post("/pipeline", dependencies=[Depends(pro_required)])
 def run_pipeline(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     """
     Body: {
@@ -378,7 +378,7 @@ def run_pipeline(payload: dict = Body(...), user_id: str = Depends(get_current_u
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.get("/pipeline/{pipeline_id}")
+@router.get("/pipeline/{pipeline_id}", dependencies=[Depends(pro_required)])
 def get_pipeline(pipeline_id: str, user_id: str = Depends(get_current_user)):
     """Poll this for video pipelines. Advances provider-side state on each call."""
     if not supabase:
@@ -417,7 +417,7 @@ def get_pipeline(pipeline_id: str, user_id: str = Depends(get_current_user)):
     return row
 
 
-@router.get("/history")
+@router.get("/history", dependencies=[Depends(pro_required)])
 def history(user_id: str = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database credentials missing on server")
