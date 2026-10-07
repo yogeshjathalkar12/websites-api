@@ -44,6 +44,16 @@ DNSBL_ZONES = [
 ]
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
+# A DKIM record lives under a "selector" name that only the sending provider
+# knows, so it can't be looked up directly. These are the names the common
+# providers use (Zoho, Google Workspace, Microsoft 365, Resend, SendGrid,
+# Mailchimp/Mandrill, Fastmail, Proton, ...). Not finding one is only a hint:
+# a provider can use a custom name, so it never changes the verdict.
+DKIM_SELECTORS = [
+    "zmail", "google", "selector1", "selector2", "resend", "default", "s1", "s2",
+    "k1", "k2", "k3", "mandrill", "mail", "dkim", "smtp", "zoho", "fm1", "fm2", "fm3", "protonmail",
+]
+
 
 def _resolver() -> "dns.resolver.Resolver":
     r = dns.resolver.Resolver()
@@ -73,18 +83,31 @@ def _mx_hosts(resolver, domain: str) -> list:
     return [str(r.exchange).rstrip(".") for r in sorted(answers, key=lambda x: x.preference)]
 
 
+def _dkim_selectors_found(resolver, domain: str) -> list:
+    """Selectors (from DKIM_SELECTORS) that have a real, non-revoked public key."""
+    found = []
+    for selector in DKIM_SELECTORS:
+        for record in _txt_records(resolver, f"{selector}._domainkey.{domain}"):
+            key = re.search(r"\bp=\s*([A-Za-z0-9+/=]+)", record)
+            if key:  # "p=" with nothing after it means the key was revoked
+                found.append(selector)
+                break
+    return found
+
+
 def _check_domain(domain: str) -> dict:
     resolver = _resolver()
     reasons = []
     try:
         mx = [h for h in _mx_hosts(resolver, domain) if h]
     except dns.resolver.NXDOMAIN:
-        return {"domain": domain, "mx": [], "spf": False, "dmarc": False, "verdict": "fail", "reasons": ["This domain doesn't exist."]}
+        return {"domain": domain, "mx": [], "spf": False, "dkim": False, "dkim_selectors": [], "dmarc": False, "verdict": "fail", "reasons": ["This domain doesn't exist."]}
     except Exception:
         mx = []
 
     spf = any(t.lower().startswith("v=spf1") for t in _txt_records(resolver, domain))
     dmarc = any(t.lower().startswith("v=dmarc1") for t in _txt_records(resolver, f"_dmarc.{domain}"))
+    dkim_selectors = _dkim_selectors_found(resolver, domain) if mx else []
 
     if not mx:
         reasons.append("No mail server is set up for this domain, so it can't receive email.")
@@ -92,9 +115,11 @@ def _check_domain(domain: str) -> dict:
         reasons.append("No SPF record: receiving servers can't confirm who is allowed to send as this domain.")
     if not dmarc:
         reasons.append("No DMARC record: nothing tells receivers what to do with fake mail from this domain.")
+    if mx and not dkim_selectors:
+        reasons.append("No DKIM signature found under the usual names (a provider can use a custom name, in which case this is fine).")
 
     verdict = "fail" if not mx else ("healthy" if spf and dmarc else "warn")
-    return {"domain": domain, "mx": mx, "spf": spf, "dmarc": dmarc, "verdict": verdict, "reasons": reasons}
+    return {"domain": domain, "mx": mx, "spf": spf, "dkim": bool(dkim_selectors), "dkim_selectors": dkim_selectors, "dmarc": dmarc, "verdict": verdict, "reasons": reasons}
 
 
 @router.get("/status")
@@ -127,7 +152,7 @@ def bulk_check(payload: dict = Body(...), user_id: str = Depends(get_current_use
 
     remaining = deduct_credit(user_id, amount=len(results))
     for bad in invalid:
-        results.append({"domain": bad, "mx": [], "spf": False, "dmarc": False, "verdict": "fail", "reasons": ["That doesn't look like a domain."]})
+        results.append({"domain": bad, "mx": [], "spf": False, "dkim": False, "dkim_selectors": [], "dmarc": False, "verdict": "fail", "reasons": ["That doesn't look like a domain."]})
     return {"results": results, "credits_left": remaining}
 
 
