@@ -475,7 +475,8 @@ def otp_send(body: OtpSendBody, user_id: str = Depends(get_current_user)):
         email, "Your Raptor verification code",
         "Confirm your data export" if body.purpose == "export" else "Confirm handing over ownership",
         f"Your verification code is <strong style=\"color:#fff;font-size:22px;letter-spacing:4px;\">{code}</strong>. "
-        "It expires in 10 minutes. If you didn't request this, someone may be using your open session - sign out and change your password.",
+        "It expires in 10 minutes. If you didn't request this OTP, please ignore this email. "
+        "If you keep receiving these, someone may be using your open session - sign out and change your password.",
     )
     _audit(org_id, user_id, "otp_sent", {"purpose": body.purpose})
     return {"ok": True, "expires_in": int(OTP_TTL.total_seconds())}
