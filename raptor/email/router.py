@@ -160,9 +160,12 @@ def reputation_tick():
 #   separate service, see utility/notifications.py.)
 SENDING_DEFAULTS = {
     'smtp': {'daily_cap': 10, 'warmup_target': 20},
+    # Same pace as the desktop app's own defaults (raptor/outreach/mailbox.py). The desktop app is the real
+    # governor; this only limits how fast mail is queued, so it never piles up and expires.
+    'desktop': {'daily_cap': 10, 'warmup_target': 20},
 }
 
-CREATABLE_PROVIDERS = ('smtp',)
+CREATABLE_PROVIDERS = ('smtp', 'desktop')
 
 SMTP_OFF_MESSAGE = ("Sending from your own mailbox isn't switched on for this server yet. "
                     "Ask us when mailbox sending will be available.")
@@ -197,7 +200,8 @@ def available_providers(user_id: str = Depends(get_current_user)):
     """Which ways of connecting a new account this server currently
     supports, plus the responsibilities statement the customer must confirm
     (and its version) so the screen shows exactly what gets recorded."""
-    return {'smtp': providers.smtp_enabled(), 'risks_version': RISKS_VERSION, 'risks_statement': RISKS_STATEMENT}
+    return {'smtp': providers.smtp_enabled(), 'desktop': True,
+            'risks_version': RISKS_VERSION, 'risks_statement': RISKS_STATEMENT}
 
 
 @router.post("/accounts/test-smtp")
@@ -222,24 +226,33 @@ def test_smtp_connection(payload: dict = Body(...), user_id: str = Depends(get_c
 @router.post("/accounts")
 def create_account(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
     _require_pro(user_id)
-    required = ['label', 'from_email', 'from_name', 'api_key']
+    provider = payload.get('provider', 'smtp')
+    # A desktop account holds no password at all: the mailbox lives in the desktop app.
+    required = ['label', 'from_email', 'from_name'] + ([] if provider == 'desktop' else ['api_key'])
     missing = [f for f in required if not str(payload.get(f, '')).strip()]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required field(s): {', '.join(missing)}")
 
-    provider = payload.get('provider', 'smtp')
     if provider not in CREATABLE_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Use one of: {', '.join(CREATABLE_PROVIDERS)}.")
     if payload.get('accepted_risks_version') != RISKS_VERSION:
         raise HTTPException(status_code=400, detail=RISKS_MESSAGE)
-    if not providers.smtp_enabled():
-        raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
-    try:
-        smtp_config = providers.validate_smtp_config(payload.get('smtp_config') or {})
-    except ValueError as err:
-        raise HTTPException(status_code=400, detail=str(err))
 
-    caps = SENDING_DEFAULTS['smtp']
+    if provider == 'desktop':
+        smtp_config, secret = None, ''
+    else:
+        if not providers.smtp_enabled():
+            raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
+        try:
+            smtp_config = providers.validate_smtp_config(payload.get('smtp_config') or {})
+            # Never save a mailbox that has not just logged in successfully: the
+            # setup screen's Test button is a convenience, this is the guarantee.
+            providers.SmtpProvider({**smtp_config, 'password': payload['api_key'].strip()}).check_connection()
+        except (ValueError, RuntimeError, providers.ProviderUnavailable) as err:
+            raise HTTPException(status_code=400, detail=f"Not connected - {err}")
+        secret = key_vault.encrypt_key(payload['api_key'].strip())
+
+    caps = SENDING_DEFAULTS[provider]
 
     row = {
         'owner_id': user_id,
@@ -249,7 +262,8 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
         'from_name': payload['from_name'].strip(),
         # For SMTP this is the mailbox password. Only the non-secret
         # settings (host/port/username/security) go in smtp_config.
-        'encrypted_api_key': key_vault.encrypt_key(payload['api_key'].strip()),
+        # Empty for a desktop account: there is no password on this server.
+        'encrypted_api_key': secret,
         'smtp_config': smtp_config,
         'daily_cap': caps['daily_cap'],
         'warmup_target': caps['warmup_target'],

@@ -2,10 +2,14 @@
 One interface, swappable providers. Add a new provider by implementing
 send() — the sender loop doesn't care which one it's talking to.
 
-One provider today:
+Two providers today:
   * smtp — the customer's own mailbox or relay (Google Workspace,
     Microsoft 365, Zoho, ...). Every send goes out from a mailbox the
     customer owns, at a human pace.
+  * desktop — sends nothing itself: the mail waits in email_relay_queue and
+    the customer's desktop app sends it from the mailbox connected THERE.
+    Works while this server cannot reach SMTP ports, and the mailbox
+    password never reaches this server (see db/migrations/2026-10-10_email_relay.sql).
 
 send() returns the provider's message id. It raises ProviderRateLimited
 when the provider or mailbox says "you've hit your limit, try later" —
@@ -23,7 +27,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from html import unescape
 
-SUPPORTED_PROVIDERS = ('smtp',)
+SUPPORTED_PROVIDERS = ('smtp', 'desktop')
 
 # 25/465/587 are the standard SMTP ports; 2525 is the common alternative
 # offered by relays (Brevo, Mailgun, SendGrid, ...) precisely because
@@ -213,6 +217,58 @@ class SmtpProvider(EmailProvider):
         return msg['Message-ID']
 
 
+# ---------------------------------------------------------------------------
+# Desktop relay
+# ---------------------------------------------------------------------------
+
+class DesktopRelayProvider(EmailProvider):
+    """"Sending" here means queueing: the row is picked up by the account
+    owner's desktop app (relay_claim), which sends it from its own mailbox
+    under its own warm-up, daily-cap, opening-hours and suppression rules.
+    Because it is just another provider, campaigns, sequences, triggers and
+    follow-ups all work through it unchanged, tracking links and unsubscribe
+    link included (they were rendered into `html` before this is called).
+
+    The row expires 48 hours after it was queued (column default): an email
+    nobody could send in that time is never sent late. The returned id is the
+    queue row's id, stored by the callers as provider_message_id, which is how
+    later results (failed, bounced, replied) find their way back."""
+
+    def __init__(self, account: dict, db=None):
+        missing = [k for k in ('id', 'owner_id') if not account.get(k)]
+        if missing:
+            raise ValueError(f"Desktop account is missing: {', '.join(missing)}.")
+        self.account_id = account['id']
+        self.user_id = account['owner_id']
+        self._db = db
+
+    def _client(self):
+        if self._db is not None:
+            return self._db
+        from raptor.utility.raptor_auth import supabase  # imported late: keeps this module importable without a database
+        if not supabase:
+            raise ProviderUnavailable("The database is not reachable right now, so the email could not be queued.")
+        return supabase
+
+    def send(self, from_email: str, from_name: str, to: str, subject: str, html: str) -> str:
+        row = {
+            'user_id': self.user_id,
+            'account_id': self.account_id,
+            'to_email': to,
+            'subject': subject,
+            'body_html': html,
+        }
+        try:
+            resp = self._client().table('email_relay_queue').insert(row).execute()
+        except ProviderRateLimited:
+            raise
+        except Exception as err:
+            raise ProviderUnavailable(f"Could not queue the email for the desktop app: {err}") from err
+        if not resp.data:
+            raise ProviderUnavailable("Could not queue the email for the desktop app.")
+        return str(resp.data[0]['id'])
+
+
 def get_provider(account: dict) -> EmailProvider:
     """`account` is the email_accounts row with the secret already
     decrypted into account['api_key'] (see sending.get_ready_provider).
@@ -221,4 +277,6 @@ def get_provider(account: dict) -> EmailProvider:
         config = dict(account.get('smtp_config') or {})
         config['password'] = account.get('api_key')
         return SmtpProvider(config)
+    if account['provider'] == 'desktop':
+        return DesktopRelayProvider(account)
     raise ValueError(f"Unknown provider: {account['provider']}")

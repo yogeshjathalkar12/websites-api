@@ -344,6 +344,9 @@ SMTP_BASE = {**BASE, 'provider': 'smtp', 'smtp_config': GOOD, 'accepted_risks_ve
 @pytest.fixture
 def smtp_on(monkeypatch):
     monkeypatch.setenv('EMAIL_SMTP_ENABLED', 'true')
+    # Creating an account now logs in first; these tests have no mail server,
+    # so pretend the login worked. Tests about a failed login override this.
+    monkeypatch.setattr(providers.SmtpProvider, 'check_connection', lambda self: None)
 
 
 @pytest.fixture(autouse=True)
@@ -536,9 +539,9 @@ def test_smtp_is_off_when_the_variable_is_not_set():
 
 
 def test_the_providers_endpoint_reports_the_switch(monkeypatch):
-    assert email_router.available_providers(user_id='u') == {'smtp': False, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
+    assert email_router.available_providers(user_id='u') == {'smtp': False, 'desktop': True, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
     monkeypatch.setenv('EMAIL_SMTP_ENABLED', 'true')
-    assert email_router.available_providers(user_id='u') == {'smtp': True, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
+    assert email_router.available_providers(user_id='u') == {'smtp': True, 'desktop': True, 'risks_version': email_router.RISKS_VERSION, 'risks_statement': email_router.RISKS_STATEMENT}
 
 
 def test_creating_an_smtp_account_is_refused_while_off_and_saves_nothing(db, monkeypatch):
@@ -655,3 +658,15 @@ def test_the_plan_is_looked_up_for_the_signed_in_user_only(monkeypatch, smtp_on)
     _create({**SMTP_BASE, 'owner_id': 'someone-else', 'user_id': 'someone-else'})   # a forged id in the body is ignored
     assert ('raptor_users', 'user_id', 'user-1') in seen
     assert all(v != 'someone-else' for _t, _c, v in seen)
+
+
+def test_an_account_whose_login_fails_is_never_saved(db, smtp_on, monkeypatch):
+    monkeypatch.setattr(email_router, '_require_pro', lambda user_id: None)   # this test is about the login, not the plan
+    _resolve_to(monkeypatch, PUBLIC_IP)
+    def refuse(self):
+        raise RuntimeError("The mail server rejected the username or password.")
+    monkeypatch.setattr(providers.SmtpProvider, 'check_connection', refuse)
+    with pytest.raises(HTTPException) as err:
+        _create(SMTP_BASE)
+    assert err.value.status_code == 400 and 'Not connected' in err.value.detail and 'rejected the username' in err.value.detail
+    assert db.inserted('email_accounts') == []
