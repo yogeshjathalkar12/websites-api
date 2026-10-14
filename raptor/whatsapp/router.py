@@ -26,6 +26,7 @@ in response to (or during) an inbound conversation window — use send_text().
 Endpoints:
   POST /accounts                    — create, access_token encrypted server-side
   POST /broadcasts/{id}/send        — one batch right now
+  POST /crm/dispatch                — sends the WhatsApp messages the CRM pipeline queued (button / automatic mode)
   POST /sequences/{id}/enroll       — add contacts to a running sequence
   POST /reply                       — manual free-text reply from the CRM ContactPanel
   POST /tick                        — cron-only, advances broadcasts + due sequence steps
@@ -34,11 +35,13 @@ Endpoints:
 """
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from fastapi import APIRouter, HTTPException, Depends, Body, Request, Header
 from fastapi.responses import PlainTextResponse
 
-from raptor.utility.raptor_auth import get_current_user, supabase, pro_required
+from raptor.utility.raptor_auth import get_current_user, supabase, pro_required, _billing_user_id
 from . import key_vault
 from . import flow_engine
 from .providers import get_provider
@@ -291,6 +294,151 @@ def trigger_broadcast(broadcast_id: str, user_id: str = Depends(get_current_user
     if broadcast['whatsapp_accounts']['owner_id'] != user_id:
         raise HTTPException(status_code=403, detail="You don't own this broadcast's account.")
     return _send_broadcast_batch(broadcast_id)
+
+
+# ---------------------------------------------------------------------------
+# CRM pipeline: the WhatsApp button and automatic mode
+# ---------------------------------------------------------------------------
+# The database decides WHETHER a deal's contact gets a message (db/migrations/2026-10-14_crm_whatsapp.sql: modes, consent,
+# skip rules) and queues it as a deal_whatsapp row with status 'pending'. Sending needs the encrypted access token, which only
+# lives here, so this function does it: the web app calls POST /crm/dispatch whenever a message is waiting.
+#
+# Rules on top of the queue: the account's own business hours (in ITS timezone) and daily limit, opt-outs checked again
+# right before sending, one claim per message so two open tabs can never send it twice, and a message whose outcome is
+# unknown (the process died mid-send) is marked failed instead of being sent again.
+
+CRM_BATCH_SIZE = 5
+CRM_MAX_ATTEMPTS = 5
+CRM_STALE_SENDING_MINUTES = 10
+
+
+def _account_zone(account: dict) -> ZoneInfo:
+    try:
+        return ZoneInfo(account.get('timezone') or 'UTC')
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return ZoneInfo('UTC')
+
+
+def _within_local_hours(account: dict, now: datetime) -> bool:
+    """Business hours judged on the account's own clock. (The older broadcast code compares them with the UTC hour.)"""
+    local_hour = now.astimezone(_account_zone(account)).hour
+    return account['business_hours_start'] <= local_hour <= account['business_hours_end']
+
+
+def _meta_error_text(err: Exception) -> str:
+    """The reason Meta gave (for example "(#131030) Recipient phone number not in allowed list"), not just "Bad Request"."""
+    response = getattr(err, 'response', None)
+    if response is not None:
+        try:
+            detail = response.json().get('error', {})
+            message = detail.get('message') or ''
+            code = detail.get('code')
+            if message:
+                return (f"(#{code}) {message}" if code else message)[:300]
+        except Exception:
+            pass
+        return f"WhatsApp refused the message (HTTP {response.status_code})."
+    return str(err)[:300] or err.__class__.__name__
+
+
+def _is_temporary(err: Exception) -> bool:
+    """A network problem, Meta being down or rate-limiting: worth trying again. A 4xx other than 429 is a real refusal."""
+    response = getattr(err, 'response', None)
+    if response is None:
+        return isinstance(err, (httpx.TimeoutException, httpx.TransportError))
+    return response.status_code == 429 or response.status_code >= 500
+
+
+def _dispatch_crm_whatsapp(owner_id: str, provider_for=None, now: datetime = None) -> dict:
+    provider_for = provider_for or _decrypted_provider
+    now = now or datetime.now(timezone.utc)
+    table = supabase.table
+    result = {'sent': 0, 'failed': 0, 'waiting': 0, 'skipped': 0}
+
+    # A message stuck in 'sending' means the process died mid-send. Whether it went out is unknown, so do not send it again.
+    stale = (now - timedelta(minutes=CRM_STALE_SENDING_MINUTES)).isoformat()
+    table('deal_whatsapp').update({
+        'status': 'failed', 'updated_at': now.isoformat(),
+        'error': 'The outcome is unknown (it may or may not have been sent). Check the WhatsApp inbox before retrying.',
+    }).eq('owner_id', owner_id).eq('status', 'sending').lt('updated_at', stale).execute()
+
+    rows = (table('deal_whatsapp').select('*').eq('owner_id', owner_id).eq('status', 'pending')
+            .order('created_at').limit(CRM_BATCH_SIZE).execute().data) or []
+
+    accounts: dict = {}
+    sent_now: dict = {}
+    for row in rows:
+        def note(text: str, **extra):
+            table('deal_whatsapp').update({'error': text, 'updated_at': now.isoformat(), **extra}).eq('deal_id', row['deal_id']).execute()
+
+        account_id = row.get('account_id')
+        if account_id not in accounts:
+            found = table('whatsapp_accounts').select('*').eq('id', account_id).limit(1).execute().data if account_id else None
+            accounts[account_id] = found[0] if found else None
+        account = accounts[account_id]
+        if not account:
+            note('The WhatsApp number for this message is no longer connected.', status='failed')
+            result['failed'] += 1
+            continue
+
+        blocked = table('whatsapp_suppressions').select('phone').eq('account_id', account['id']).eq('phone', row['to_phone']).limit(1).execute().data
+        if blocked:
+            note('This person opted out of WhatsApp messages.', status='skipped')
+            result['skipped'] += 1
+            continue
+
+        if not _within_local_hours(account, now):
+            note(f"Waiting for business hours ({account['business_hours_start']:02d}:00 to {account['business_hours_end']:02d}:00 {account.get('timezone') or 'UTC'})")
+            result['waiting'] += 1
+            continue
+
+        remaining = todays_allowed_volume(account) - _already_sent_today(account['id']) - sent_now.get(account['id'], 0)
+        if remaining <= 0:
+            note("Today's WhatsApp sending limit is reached; it will go out tomorrow.")
+            result['waiting'] += 1
+            continue
+
+        # One claim per message: only the caller whose update matches a still-'pending' row may send it.
+        claimed = (table('deal_whatsapp').update({'status': 'sending', 'attempts': (row.get('attempts') or 0) + 1, 'error': None, 'updated_at': now.isoformat()})
+                   .eq('deal_id', row['deal_id']).eq('status', 'pending').execute().data)
+        if not claimed:
+            continue
+
+        try:
+            provider = provider_for(account)
+            message_id = provider.send_template(row['to_phone'], row['template_name'], row.get('template_language') or 'en_US', row.get('params') or [])
+        except Exception as err:
+            if _is_temporary(err) and (row.get('attempts') or 0) + 1 < CRM_MAX_ATTEMPTS:
+                note('A temporary problem stopped this message; it will be tried again.', status='pending')
+                result['waiting'] += 1
+            else:
+                note(_meta_error_text(err), status='failed')
+                result['failed'] += 1
+                print(f"CRM WhatsApp to {row['to_phone']} failed: {err}")
+            continue
+
+        table('deal_whatsapp').update({'status': 'sent', 'message_id': message_id, 'sent_at': now.isoformat(), 'error': None,
+                                       'updated_at': now.isoformat()}).eq('deal_id', row['deal_id']).execute()
+        sent_now[account['id']] = sent_now.get(account['id'], 0) + 1
+        result['sent'] += 1
+        try:
+            preview = f"[CRM] {row['template_name']}"
+            conversation_id = _touch_conversation(account['id'], row['to_phone'], 'outbound', preview, row.get('contact_id'))
+            table('whatsapp_events').insert({'account_id': account['id'], 'contact_phone': row['to_phone'], 'direction': 'outbound',
+                                             'event_type': 'sent', 'provider_message_id': message_id, 'conversation_id': conversation_id}).execute()
+            _log_interaction(row.get('contact_id'), 'outbound', f"[WhatsApp from the pipeline] template '{row['template_name']}'")
+        except Exception as err:
+            print(f"WhatsApp was sent but logging it failed for {row['to_phone']}: {err}")  # the message is out; never undo that
+
+    left = table('deal_whatsapp').select('deal_id', count='exact').eq('owner_id', owner_id).eq('status', 'pending').execute()
+    result['pending_left'] = left.count or 0
+    return result
+
+
+@router.post("/crm/dispatch", dependencies=[Depends(pro_required)])
+def crm_dispatch(user_id: str = Depends(get_current_user)):
+    """Sends the caller's organization's queued CRM WhatsApp messages (a few at a time). Safe to call as often as you like."""
+    return _dispatch_crm_whatsapp(_billing_user_id(user_id))
 
 
 # ---------------------------------------------------------------------------
