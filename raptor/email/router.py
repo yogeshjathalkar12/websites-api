@@ -41,6 +41,7 @@ or from outside (this file's /events/webhook route, via event_sources.py).
 """
 import hmac
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -195,6 +196,56 @@ RISKS_MESSAGE = ("Please confirm the statement about your responsibilities befor
                  "If you already did, reload the page — the wording may have been updated.")
 
 
+# ---------------------------------------------------------------------------
+# A desktop account can carry the WHOLE mailbox (settings + password)
+# ---------------------------------------------------------------------------
+# So the web app and the desktop app share one source of truth for "which mailbox is connected". This server never
+# logs in with the password (its host cannot reach mail servers); the owner's desktop app fetches it from
+# GET /accounts/{id}/credentials and does the sending. The password is encrypted with key_vault before it is saved.
+
+_HOSTNAME_RE = re.compile(r'[a-z0-9]([a-z0-9.\-]*[a-z0-9])?')
+IMAP_PORTS = (993, 143)
+
+
+def _whole_number(value, low: int, high: int, message: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(message)
+    if not low <= number <= high:
+        raise ValueError(message)
+    return number
+
+
+def _mailbox_extras(config: dict) -> dict:
+    """Checks the non-secret mailbox settings beyond the SMTP ones (inbox server, signature, rules)."""
+    imap_host = str(config.get('imap_host', '')).strip().lower()
+    if imap_host and (len(imap_host) > 253 or not _HOSTNAME_RE.fullmatch(imap_host) or '.' not in imap_host):
+        raise ValueError("Enter your inbox server's host name, like imap.gmail.com.")
+    imap_port = _whole_number(config.get('imap_port') or 993, 1, 65535, "The inbox port must be a number.")
+    if imap_port not in IMAP_PORTS:
+        raise ValueError("The inbox port must be 993 (SSL) or 143.")
+    signature = str(config.get('signature', '')).strip()
+    if len(signature) > 600:
+        raise ValueError("The signature is too long (600 characters at most).")
+    threshold = _whole_number(config.get('icp_threshold', 70), 0, 100, "The prospect-fit threshold must be between 0 and 100.")
+    return {'imap_host': imap_host, 'imap_port': imap_port, 'signature': signature,
+            'weekdays_only': bool(config.get('weekdays_only', True)), 'icp_threshold': threshold}
+
+
+def _mailbox_limits(payload: dict, defaults: dict) -> dict:
+    """The sending rules (daily limits and hours), checked, as database columns."""
+    daily = _whole_number(payload.get('daily_cap', defaults['daily_cap']), 1, 100, "The first-day limit must be between 1 and 100 emails.")
+    target = _whole_number(payload.get('warmup_target', defaults['warmup_target']), 1, 200, "The daily maximum must be between 1 and 200 emails.")
+    if target < daily:
+        raise ValueError("The daily maximum cannot be lower than the first-day limit.")
+    start = _whole_number(payload.get('hours_start', 9), 0, 23, "The sending start hour must be between 0 and 23.")
+    end = _whole_number(payload.get('hours_end', 19), 1, 24, "The sending end hour must be between 1 and 24.")
+    if end <= start:
+        raise ValueError("The sending end hour must be after the start hour.")
+    return {'daily_cap': daily, 'warmup_target': target, 'business_hours_start': start, 'business_hours_end': end}
+
+
 @router.get("/providers")
 def available_providers(user_id: str = Depends(get_current_user)):
     """Which ways of connecting a new account this server currently
@@ -238,8 +289,21 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
     if payload.get('accepted_risks_version') != RISKS_VERSION:
         raise HTTPException(status_code=400, detail=RISKS_MESSAGE)
 
+    limits = None
     if provider == 'desktop':
-        smtp_config, secret = None, ''
+        password = str(payload.get('api_key', '')).strip()
+        if password:
+            # The whole mailbox, stored for the owner's desktop app. No login is tried here: this server cannot reach
+            # mail servers, so the desktop app checks the login the first time it uses the mailbox.
+            try:
+                raw_config = payload.get('smtp_config') or {}
+                smtp_config = {**providers.validate_smtp_config(raw_config), **_mailbox_extras(raw_config)}
+                limits = _mailbox_limits(payload, SENDING_DEFAULTS['desktop'])
+            except ValueError as err:
+                raise HTTPException(status_code=400, detail=str(err))
+            secret = key_vault.encrypt_key(password)
+        else:
+            smtp_config, secret = None, ''
     else:
         if not providers.smtp_enabled():
             raise HTTPException(status_code=400, detail=SMTP_OFF_MESSAGE)
@@ -277,6 +341,8 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
         # key_vault here.
         'inbound_webhook_secret': secrets.token_urlsafe(24),
     }
+    if limits:
+        row.update(limits)
     resp = supabase.table('email_accounts').insert(row).execute()
     if not resp.data:
         raise HTTPException(status_code=500, detail="Could not save this account.")
@@ -288,6 +354,27 @@ def create_account(payload: dict = Body(...), user_id: str = Depends(get_current
     # fetchAccounts, so this creation response is the only place it's
     # visible without a dedicated "reveal" endpoint (worth adding later).
     return account
+
+
+@router.get("/accounts/{account_id}/credentials")
+def get_mailbox_credentials(account_id: str, response: Response, user_id: str = Depends(get_current_user)):
+    """The owner's desktop app fetches its stored mailbox here (settings and the decrypted password) so that it sends
+    from the mailbox connected in the web app. Owner only; never cached."""
+    _require_pro(user_id)
+    found = supabase.table('email_accounts').select('*').eq('id', account_id).eq('owner_id', user_id).limit(1).execute()
+    rows = found.data or []
+    row = rows[0] if rows else None
+    if not row or row.get('provider') != 'desktop' or not row.get('encrypted_api_key'):
+        raise HTTPException(status_code=404, detail="No stored mailbox found for that account.")
+    response.headers['Cache-Control'] = 'no-store'
+    return {
+        'id': row['id'], 'label': row.get('label'), 'from_email': row.get('from_email'), 'from_name': row.get('from_name'),
+        'smtp_config': row.get('smtp_config') or {},
+        'password': key_vault.decrypt_key(row['encrypted_api_key']),
+        'daily_cap': row.get('daily_cap'), 'warmup_target': row.get('warmup_target'),
+        'business_hours_start': row.get('business_hours_start'), 'business_hours_end': row.get('business_hours_end'),
+        'timezone': row.get('timezone'),
+    }
 
 
 # ---------------------------------------------------------------------------
