@@ -7,6 +7,9 @@
   DELETE /{id}               disconnect (its secret and signals go with it)
   POST   /{id}/sync          fetch fresh data now (rate limited per connection)
   GET    /{id}/signals       the latest signals of one connection
+  POST   /oauth/start        begin "sign in with Google" for a connector that needs it -> {url}
+  GET    /oauth/google/callback   where Google sends the person back; finishes the connection, then returns them to the app
+  POST   /{id}/reply         post a reply to a comment as the connected account {parent_id, text}
   POST   /tick               cron only: sync every connection that is due
 
 Rules: everything belongs to the caller's ORGANIZATION (owner_id = org id). Connecting, changing and removing need the
@@ -19,19 +22,25 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from urllib.parse import urlencode
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from raptor.utility import raptor_auth
 from raptor.utility.raptor_auth import get_current_user, require_pro
 
-from . import registry, vault
+from . import google_oauth, registry, vault
 from .registry import ConnectorError
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_CONNECTIONS_PER_ORG = 25
+MAX_REPLIES_PER_DAY = 50           # per connection: a safety net against a runaway client, far above what a person writes by hand
+MAX_REPLY_LENGTH = 10000
+OAUTH_STATE_SECONDS = 600
 SYNC_CHUNK = 500
 TICK_BATCH = 50
 TICK_INTERVAL_HOURS = 6
@@ -133,6 +142,44 @@ def _run_sync(connection: dict) -> int:
     return len(rows)
 
 
+def _web_app_connections_url(**params) -> str:
+    base = os.environ.get("WEB_APP_URL", "https://shoonyaorigins.com/ventures/raptor/app/").rstrip("/") + "/"
+    return f"{base}#/connections" + ("?" + urlencode(params) if params else "")
+
+
+def _store_connection(org_id: str, user_id: str, connector, result, label: Optional[str] = None) -> dict:
+    """Saves a new connection (or, if this exact thing is already connected by signing in, refreshes its secret and wakes it up), then
+    fetches the first data. A failure of that first fetch is recorded on the connection and does not undo the connection."""
+    db = _db()
+    existing = db.table("connections").select("id,provider,external_id").eq("owner_id", org_id).execute().data or []
+    same = next((r for r in existing if r.get("provider") == connector.provider and r.get("external_id") == result.external_id), None)
+    if same and not result.secret:
+        raise HTTPException(status_code=409, detail="This is already connected.")
+    now = _now().isoformat()
+    if same:
+        created = same
+        db.table("connections").update({"status": "connected", "last_error": None, "config": result.config or {}, "updated_at": now}).eq("id", same["id"]).execute()
+        db.table("connection_secrets").delete().eq("connection_id", same["id"]).execute()
+    else:
+        if len(existing) >= MAX_CONNECTIONS_PER_ORG:
+            raise HTTPException(status_code=400, detail=f"You can have up to {MAX_CONNECTIONS_PER_ORG} connections.")
+        row = {
+            "owner_id": org_id, "created_by": user_id, "provider": connector.provider,
+            "label": (label or result.label or connector.title)[:120], "external_id": result.external_id,
+            "status": "connected", "config": result.config or {}, "created_at": now, "updated_at": now,
+        }
+        created = (db.table("connections").insert(row).execute().data or [row])[0]
+    if result.secret:
+        db.table("connection_secrets").insert({"connection_id": created["id"], "encrypted_secret": vault.encrypt_secret(result.secret)}).execute()
+    full = db.table("connections").select("*").eq("id", created["id"]).limit(1).execute().data or [created]
+    try:
+        _run_sync(full[0])
+    except HTTPException as err:
+        log.warning("first sync of %s failed: %s", connector.provider, err.detail)
+    fresh = db.table("connections").select(PUBLIC_FIELDS).eq("id", created["id"]).limit(1).execute().data or [created]
+    return fresh[0]
+
+
 # ───────────────────────── routes ─────────────────────────
 
 @router.get("/providers")
@@ -159,10 +206,8 @@ def connect(body: ConnectBody, user_id: str = Depends(get_current_user)):
     connector = _connector(body.provider)
     if not connector.available():
         raise HTTPException(status_code=503, detail=f"{connector.title} is not switched on for this Raptor server yet.")
-    db = _db()
-    existing = db.table("connections").select("id,provider,external_id").eq("owner_id", org_id).execute().data or []
-    if len(existing) >= MAX_CONNECTIONS_PER_ORG:
-        raise HTTPException(status_code=400, detail=f"You can have up to {MAX_CONNECTIONS_PER_ORG} connections.")
+    if connector.auth == "oauth":
+        raise HTTPException(status_code=400, detail="This one connects by signing in. Use the sign-in button.")
     inputs = {k: (v.strip() if isinstance(v, str) else v) for k, v in (body.inputs or {}).items()}
     for f in connector.fields:
         if f.required and not str(inputs.get(f.name) or "").strip():
@@ -171,23 +216,86 @@ def connect(body: ConnectBody, user_id: str = Depends(get_current_user)):
         result = connector.connect(inputs)
     except ConnectorError as err:
         raise HTTPException(status_code=422, detail=str(err))
-    if any(r.get("provider") == connector.provider and r.get("external_id") == result.external_id for r in existing):
-        raise HTTPException(status_code=409, detail="This is already connected.")
-    now = _now().isoformat()
-    row = {
-        "owner_id": org_id, "created_by": user_id, "provider": connector.provider,
-        "label": (body.label or result.label or connector.title)[:120], "external_id": result.external_id,
-        "status": "connected", "config": result.config or {}, "created_at": now, "updated_at": now,
-    }
-    created = (db.table("connections").insert(row).execute().data or [row])[0]
-    if result.secret:
-        db.table("connection_secrets").insert({"connection_id": created["id"], "encrypted_secret": vault.encrypt_secret(result.secret)}).execute()
+    return {"connection": _public(_store_connection(org_id, user_id, connector, result, body.label))}
+
+
+class OAuthStartBody(BaseModel):
+    provider: str
+
+
+@router.post("/oauth/start")
+def oauth_start(body: OAuthStartBody, user_id: str = Depends(get_current_user)):
+    org_id = _manager(user_id)
+    connector = _connector(body.provider)
+    if connector.auth != "oauth":
+        raise HTTPException(status_code=400, detail="This one does not use a sign-in.")
+    if not connector.available():
+        raise HTTPException(status_code=503, detail=f"{connector.title} is not switched on for this Raptor server yet.")
+    state = vault.sign_state({"o": org_id, "u": user_id, "p": connector.provider})
+    return {"url": connector.authorize_url(state, google_oauth.redirect_uri())}
+
+
+@router.get("/oauth/google/callback", include_in_schema=False)
+def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
+    """Google sends the person's browser here after they approved (or refused). There is no login token on this request, so who
+    it is for comes from the signed, short-lived state made in oauth_start. Always ends by sending the person back to the app."""
+    def back(**params):
+        return RedirectResponse(_web_app_connections_url(**params), status_code=302)
+
+    if error or not code:
+        return back(oauth_error="You did not allow access, so nothing was connected.")
     try:
-        _run_sync(created)                       # first data right away; a failure is recorded on the connection, not fatal here
+        data = vault.read_state(state, OAUTH_STATE_SECONDS)
+        org_id, user_id = data["o"], data["u"]
+        connector = _connector(data["p"])
+        if _manager(user_id) != org_id:
+            raise HTTPException(status_code=403, detail="Your organization changed. Start again.")
+        result = connector.complete(code, google_oauth.redirect_uri())
+        connection = _store_connection(org_id, user_id, connector, result)
     except HTTPException as err:
-        log.warning("first sync of %s failed: %s", connector.provider, err.detail)
-    fresh = db.table("connections").select(PUBLIC_FIELDS).eq("id", created["id"]).limit(1).execute().data or [created]
-    return {"connection": _public(fresh[0])}
+        return back(oauth_error=str(err.detail))
+    except (ConnectorError, KeyError) as err:
+        return back(oauth_error=str(err) or "The sign-in could not be completed. Try again.")
+    return back(connected=connection["provider"])
+
+
+class ReplyBody(BaseModel):
+    parent_id: str
+    text: str
+
+
+@router.post("/{connection_id}/reply")
+def reply(connection_id: str, body: ReplyBody, user_id: str = Depends(get_current_user)):
+    org_id = _manager(user_id)
+    connection = _owned(org_id, connection_id)
+    connector = _connector(connection["provider"])
+    if not connector.can_reply:
+        raise HTTPException(status_code=400, detail="This connection cannot post replies.")
+    if connection["status"] != "connected":
+        raise HTTPException(status_code=409, detail="This connection needs attention before it can reply. Reconnect it first.")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Write a reply first.")
+    if len(text) > MAX_REPLY_LENGTH:
+        raise HTTPException(status_code=400, detail=f"A reply can be up to {MAX_REPLY_LENGTH} characters.")
+    parent = (body.parent_id or "").strip()
+    if not parent:
+        raise HTTPException(status_code=400, detail="Choose the comment to reply to.")
+    db = _db()
+    today = _now().strftime("%Y-%m-%d")
+    sent = db.table("signals").select("occurred_at").eq("connection_id", connection_id).eq("name", "reply_sent").limit(500).execute().data or []
+    if sum(1 for r in sent if str(r.get("occurred_at", ""))[:10] == today) >= MAX_REPLIES_PER_DAY:
+        raise HTTPException(status_code=429, detail="Daily reply limit reached. Try again tomorrow.")
+    try:
+        posted = connector.reply(connection, _secret_of(connection_id), parent, text)
+    except ConnectorError as err:
+        raise HTTPException(status_code=422, detail=str(err))
+    db.table("signals").upsert([{
+        "owner_id": org_id, "connection_id": connection_id, "provider": connection["provider"], "kind": "event", "name": "reply_sent",
+        "text_value": text[:2000], "entity": {"parent_id": parent, "reply_id": posted, "sent_by": user_id},
+        "occurred_at": _now().isoformat(), "dedupe_key": f"reply:{posted or _now().isoformat()}",
+    }], on_conflict="connection_id,dedupe_key", ignore_duplicates=True).execute()
+    return {"ok": True, "reply_id": posted}
 
 
 class PatchBody(BaseModel):
@@ -213,7 +321,13 @@ def patch(connection_id: str, body: PatchBody, user_id: str = Depends(get_curren
 @router.delete("/{connection_id}")
 def disconnect(connection_id: str, user_id: str = Depends(get_current_user)):
     org_id = _manager(user_id)
-    _owned(org_id, connection_id)
+    connection = _owned(org_id, connection_id)
+    connector = registry.get(connection["provider"])
+    if connector and connector.auth == "oauth":
+        try:
+            connector.revoke(_secret_of(connection_id))      # withdraw the person's approval at Google, best effort
+        except Exception:
+            log.warning("could not revoke access for connection %s", connection_id)
     _db().table("connections").delete().eq("id", connection_id).eq("owner_id", org_id).execute()   # secret + signals cascade
     return {"ok": True}
 

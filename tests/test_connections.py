@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 os.environ.setdefault('EMAIL_KEY_ENCRYPTION_SECRET', Fernet.generate_key().decode())
 
-from raptor.connections import registry, router as conn_router, vault, youtube  # noqa: E402
+from raptor.connections import google_oauth, registry, router as conn_router, vault, youtube, youtube_account  # noqa: E402
 from raptor.utility import raptor_auth  # noqa: E402
 
 CHANNEL_ID = 'UC' + 'a' * 22
@@ -92,7 +92,7 @@ class FakeResponse:
 
 
 def fake_youtube(calls, quota=False):
-    def get(url, params=None, timeout=None):
+    def get(url, params=None, headers=None, timeout=None):
         calls.append((url, dict(params or {})))
         if quota:
             return FakeResponse(403, {'error': {'errors': [{'reason': 'quotaExceeded'}]}})
@@ -107,6 +107,18 @@ def fake_youtube(calls, quota=False):
                                                  'contentDetails': {'relatedPlaylists': {'uploads': 'UU123'}}}]})
         if path == 'playlistItems':
             return FakeResponse(200, {'items': [{'contentDetails': {'videoId': 'v1'}}, {'contentDetails': {'videoId': 'v2'}}]})
+        if path == 'commentThreads':
+            if params.get('videoId') == 'v2':
+                return FakeResponse(403, {'error': {'errors': [{'reason': 'commentsDisabled'}]}})
+            return FakeResponse(200, {'items': [
+                {'id': 'c1', 'snippet': {'totalReplyCount': 1, 'topLevelComment': {'id': 'c1', 'snippet': {
+                    'videoId': 'v1', 'textDisplay': 'Great &amp; useful<br>video', 'authorDisplayName': 'Priya', 'likeCount': 4,
+                    'authorChannelUrl': 'http://www.youtube.com/channel/UCpriya', 'authorChannelId': {'value': 'UCpriya'},
+                    'publishedAt': '2026-10-17T10:00:00Z'}}}},
+                {'id': 'c2', 'snippet': {'totalReplyCount': 0, 'topLevelComment': {'id': 'c2', 'snippet': {
+                    'videoId': 'v1', 'textDisplay': 'our own comment', 'authorDisplayName': 'Acme TV',
+                    'authorChannelId': {'value': CHANNEL_ID}, 'publishedAt': '2026-10-17T11:00:00Z'}}}},
+            ]})
         if path == 'videos':
             return FakeResponse(200, {'items': [
                 {'id': 'v1', 'snippet': {'title': 'First'}, 'statistics': {'viewCount': '500', 'likeCount': '20', 'commentCount': '3'}},
@@ -195,7 +207,7 @@ def test_connecting_a_channel_stores_it_for_the_organization_and_fetches_first_d
     row = world.tables['connections'][0]
     assert row['owner_id'] == 'org-1' and row['created_by'] == 'owner'            # the organization, not the person
     names = sorted({s['name'] for s in world.tables['signals']})
-    assert names == ['subscribers', 'video_comments', 'video_likes', 'video_views', 'videos', 'views']
+    assert names == ['comment', 'subscribers', 'video_comments', 'video_likes', 'video_views', 'videos', 'views']
     assert all(s['owner_id'] == 'org-1' and s['connection_id'] == row['id'] for s in world.tables['signals'])
     assert 'secret' not in str(result).lower()
 
@@ -361,3 +373,285 @@ def test_one_failing_connection_does_not_stop_the_scheduled_run(world, monkeypat
     world.tables['connections'][0]['last_sync_at'] = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
     monkeypatch.setattr(youtube.httpx, 'get', fake_youtube([], quota=True))
     assert conn_router.tick() == {'synced': 0, 'failed': 1}
+
+
+# ───────────────────────── public comments ─────────────────────────
+
+def test_public_comments_are_read_as_plain_text_without_the_channels_own(world):
+    _connect()
+    comments = [s for s in world.tables['signals'] if s['name'] == 'comment']
+    assert len(comments) == 1                                     # the channel's own comment is not a lead
+    c = comments[0]
+    assert c['kind'] == 'mention' and c['text_value'] == 'Great & useful\nvideo'
+    assert c['entity']['author'] == 'Priya' and c['entity']['comment_id'] == 'c1' and c['entity']['title'] == 'First'
+    assert c['occurred_at'].startswith('2026-10-17') and c['dedupe_key'] == 'comment:c1'
+
+
+def test_a_video_with_comments_turned_off_is_skipped_quietly(world):
+    _connect()                                                    # v2 has comments disabled in the fake
+    assert world.tables['connections'][0]['status'] == 'connected'
+
+
+# ───────────────────────── sign in with Google ─────────────────────────
+
+ACCOUNT_SCOPES = ' '.join(youtube_account.SCOPES)
+
+
+@pytest.fixture
+def google(world, monkeypatch):
+    """A Google that approves sign-ins, with a recorder of what was sent to it."""
+    monkeypatch.setenv('GOOGLE_OAUTH_CLIENT_ID', 'client-id')
+    monkeypatch.setenv('GOOGLE_OAUTH_CLIENT_SECRET', 'client-secret')
+    monkeypatch.setenv('WEB_APP_URL', 'https://app.test/ventures/raptor/app/')
+    sent = {'posts': [], 'revoked': [], 'granted_scope': ACCOUNT_SCOPES, 'refresh': 'refresh-123', 'reply_status': 200,
+            'analytics_status': 200, 'token_error': None}
+
+    def post(url, data=None, json=None, params=None, headers=None, timeout=None):
+        sent['posts'].append((url, data, json, params, headers))
+        if url == google_oauth.TOKEN_URL:
+            if sent['token_error']:
+                return FakeResponse(400, {'error': sent['token_error']})
+            if data['grant_type'] == 'authorization_code':
+                body = {'access_token': 'access-1', 'scope': sent['granted_scope']}
+                if sent['refresh']:
+                    body['refresh_token'] = sent['refresh']
+                return FakeResponse(200, body)
+            return FakeResponse(200, {'access_token': 'access-2'})
+        if url == google_oauth.REVOKE_URL:
+            sent['revoked'].append(data['token'])
+            return FakeResponse(200, {})
+        if url.endswith('/youtube/v3/comments'):
+            return FakeResponse(sent['reply_status'], {'id': 'reply-9'})
+        raise AssertionError('unexpected POST ' + url)
+
+    inner = youtube.httpx.get
+
+    def get(url, params=None, headers=None, timeout=None):
+        if 'youtubeanalytics' in url:
+            if sent['analytics_status'] != 200:
+                return FakeResponse(sent['analytics_status'], {'error': {'errors': [{'reason': 'accessNotConfigured'}]}})
+            return FakeResponse(200, {'columnHeaders': [{'name': 'views'}, {'name': 'estimatedMinutesWatched'}, {'name': 'subscribersGained'}],
+                                      'rows': [[1500, 4200, 30]]})
+        if headers and params.get('mine') == 'true':
+            sent.setdefault('mine_calls', []).append(headers['Authorization'])
+            return FakeResponse(200, {'items': [{'id': CHANNEL_ID, 'snippet': {'title': 'Acme TV', 'customUrl': '@acme'},
+                                                 'statistics': {'subscriberCount': '1200', 'viewCount': '98000', 'videoCount': '40'},
+                                                 'contentDetails': {'relatedPlaylists': {'uploads': 'UU123'}}}]})
+        if headers and 'allThreadsRelatedToChannelId' in (params or {}):
+            sent.setdefault('thread_calls', []).append(headers['Authorization'])
+            return FakeResponse(200, {'items': [
+                {'id': 'c9', 'snippet': {'videoId': 'v1', 'totalReplyCount': 0, 'topLevelComment': {'id': 'c9', 'snippet': {
+                    'videoId': 'v1', 'textOriginal': 'Can you share pricing?', 'authorDisplayName': 'Ravi',
+                    'authorChannelId': {'value': 'UCravi'}, 'publishedAt': '2026-10-18T08:00:00Z'}}}}]})
+        return inner(url, params=params, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr(google_oauth.httpx, 'post', post)
+    monkeypatch.setattr(youtube_account.httpx, 'post', post)
+    monkeypatch.setattr(youtube_account.httpx, 'get', get)
+    monkeypatch.setattr(youtube.httpx, 'get', get)
+    return sent
+
+
+def _sign_in(user='owner', granted=None):
+    started = conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_account'), user_id=user)
+    state = started['url'].split('state=')[1].split('&')[0]
+    from urllib.parse import unquote
+    return conn_router.oauth_google_callback(code='auth-code', state=unquote(state))
+
+
+def test_starting_a_sign_in_builds_the_google_address_with_a_signed_state(world, google):
+    started = conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_account'), user_id='owner')
+    url = started['url']
+    assert url.startswith(google_oauth.AUTH_URL) and 'client_id=client-id' in url and 'access_type=offline' in url
+    assert 'youtube.force-ssl' in url and 'yt-analytics.readonly' in url
+    assert 'client-secret' not in url
+    assert 'redirect_uri=' in url and 'oauth%2Fgoogle%2Fcallback' in url
+
+
+def test_only_a_manager_on_pro_can_start_a_sign_in(world, google):
+    for user, status in (('member', 403), ('other', 403)):
+        with pytest.raises(HTTPException) as err:
+            conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_account'), user_id=user)
+        assert err.value.status_code == status
+
+
+def test_a_sign_in_that_is_not_switched_on_says_so(world, monkeypatch):
+    monkeypatch.delenv('GOOGLE_OAUTH_CLIENT_ID', raising=False)
+    with pytest.raises(HTTPException) as err:
+        conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_account'), user_id='owner')
+    assert err.value.status_code == 503
+
+
+def test_sign_in_connectors_cannot_be_connected_with_a_form_and_form_ones_cannot_sign_in(world, google):
+    with pytest.raises(HTTPException) as err:
+        conn_router.connect(conn_router.ConnectBody(provider='youtube_account', inputs={}), user_id='owner')
+    assert err.value.status_code == 400
+    with pytest.raises(HTTPException) as err:
+        conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_public'), user_id='owner')
+    assert err.value.status_code == 400
+
+
+def test_approving_creates_the_connection_stores_the_token_encrypted_and_returns_to_the_app(world, google):
+    response = _sign_in()
+    assert response.status_code == 302 and response.headers['location'] == 'https://app.test/ventures/raptor/app/#/connections?connected=youtube_account'
+    conn = world.tables['connections'][0]
+    assert conn['provider'] == 'youtube_account' and conn['owner_id'] == 'org-1' and conn['created_by'] == 'owner' and conn['status'] == 'connected'
+    stored = world.tables['connection_secrets'][0]['encrypted_secret']
+    assert 'refresh-123' not in stored and 'refresh-123' in vault.decrypt_secret(stored)         # encrypted, not plain
+    assert 'refresh-123' not in str(world.tables['connections']) and 'refresh-123' not in str(world.tables['signals'])
+    names = {s['name'] for s in world.tables['signals']}
+    assert {'subscribers', 'comment', 'views_28d', 'watch_minutes_28d', 'subs_gained_28d'} <= names
+    comment = [s for s in world.tables['signals'] if s['name'] == 'comment'][0]
+    assert comment['text_value'] == 'Can you share pricing?' and comment['entity']['comment_id'] == 'c9'
+    assert google['mine_calls'] and set(google['mine_calls']) <= {'Bearer access-1', 'Bearer access-2'}   # acted as the person
+
+
+def test_refusing_connects_nothing_and_says_why(world, google):
+    response = conn_router.oauth_google_callback(code='', state='x', error='access_denied')
+    assert 'oauth_error=' in response.headers['location'] and 'did+not+allow' in response.headers['location']
+    assert world.tables.get('connections', []) == []
+
+
+def test_a_forged_or_old_state_is_refused(world, google):
+    response = conn_router.oauth_google_callback(code='c', state='not-a-real-state')
+    assert 'oauth_error=' in response.headers['location'] and 'expired' in response.headers['location']
+    assert world.tables.get('connections', []) == []
+    token = vault.sign_state({'o': 'org-1', 'u': 'owner', 'p': 'youtube_account'})
+    import time
+    time.sleep(1.1)
+    with pytest.raises(HTTPException):
+        vault.read_state(token, max_age=0)
+
+
+def test_a_person_who_lost_permission_before_approving_connects_nothing(world, google):
+    started = conn_router.oauth_start(conn_router.OAuthStartBody(provider='youtube_account'), user_id='manager')
+    from urllib.parse import unquote
+    state = unquote(started['url'].split('state=')[1].split('&')[0])
+    world.tables['org_members'][2]['permissions'] = {}
+    response = conn_router.oauth_google_callback(code='c', state=state)
+    assert 'oauth_error=' in response.headers['location'] and world.tables.get('connections', []) == []
+
+
+def test_without_long_term_access_or_all_permissions_nothing_is_connected(world, google):
+    google['refresh'] = None
+    assert 'long-term' in _sign_in().headers['location'] or 'long-term' in _sign_in().headers['location'].replace('+', ' ')
+    google['refresh'], google['granted_scope'] = 'r', 'https://www.googleapis.com/auth/yt-analytics.readonly'
+    assert 'both' in _sign_in().headers['location'].replace('+', ' ')
+    assert world.tables.get('connections', []) == []
+
+
+def test_signing_in_again_updates_the_same_connection_instead_of_adding_one(world, google):
+    _sign_in()
+    google['refresh'] = 'refresh-NEW'
+    _sign_in()
+    assert len(world.tables['connections']) == 1 and len(world.tables['connection_secrets']) == 1
+    assert 'refresh-NEW' in vault.decrypt_secret(world.tables['connection_secrets'][0]['encrypted_secret'])
+
+
+def test_an_expired_google_approval_is_shown_as_needing_a_sign_in(world, google):
+    _sign_in()
+    world.tables['connections'][0]['last_sync_at'] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    google['token_error'] = 'invalid_grant'
+    with pytest.raises(HTTPException) as err:
+        conn_router.sync_now(world.tables['connections'][0]['id'], user_id='owner')
+    assert err.value.status_code == 422 and 'Sign in with Google again' in err.value.detail
+    assert world.tables['connections'][0]['status'] == 'error'
+
+
+def test_a_missing_analytics_service_is_explained(world, google):
+    google['analytics_status'] = 403
+    response = _sign_in()
+    assert world.tables['connections'][0]['status'] == 'error'
+    assert 'Analytics' in world.tables['connections'][0]['last_error']
+    assert response.status_code == 302
+
+
+# ───────────────────────── replying ─────────────────────────
+
+def _signed_in_connection(world):
+    _sign_in()
+    return world.tables['connections'][0]['id']
+
+
+def test_a_reply_is_posted_as_the_channel_and_recorded(world, google):
+    cid = _signed_in_connection(world)
+    result = conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='  Yes, pricing is on our site.  '), user_id='owner')
+    assert result == {'ok': True, 'reply_id': 'reply-9'}
+    url, data, body, params, headers = google['posts'][-1]
+    assert url.endswith('/youtube/v3/comments') and body == {'snippet': {'parentId': 'c9', 'textOriginal': 'Yes, pricing is on our site.'}}
+    assert headers['Authorization'] == 'Bearer access-2'
+    event = [s for s in world.tables['signals'] if s['name'] == 'reply_sent'][0]
+    assert event['kind'] == 'event' and event['entity']['parent_id'] == 'c9' and event['entity']['sent_by'] == 'owner'
+
+
+def test_only_managers_can_reply_and_others_see_a_clear_refusal(world, google):
+    cid = _signed_in_connection(world)
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='hi'), user_id='member')
+    assert err.value.status_code == 403
+    assert not [p for p in google['posts'] if p[0].endswith('/comments')]
+    assert conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='hi'), user_id='manager')['ok']
+
+
+def test_an_empty_too_long_or_targetless_reply_is_refused_before_anything_is_sent(world, google):
+    cid = _signed_in_connection(world)
+    for body in (conn_router.ReplyBody(parent_id='c9', text='   '),
+                 conn_router.ReplyBody(parent_id='c9', text='x' * (conn_router.MAX_REPLY_LENGTH + 1)),
+                 conn_router.ReplyBody(parent_id=' ', text='hi')):
+        with pytest.raises(HTTPException) as err:
+            conn_router.reply(cid, body, user_id='owner')
+        assert err.value.status_code == 400
+    assert not [p for p in google['posts'] if p[0].endswith('/comments')]
+
+
+def test_a_connection_without_reply_support_or_needing_attention_cannot_reply(world, google):
+    created = _connect()['connection']
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(created['id'], conn_router.ReplyBody(parent_id='c1', text='hi'), user_id='owner')
+    assert err.value.status_code == 400
+    _sign_in()
+    cid = world.tables['connections'][-1]['id']
+    world.tables['connections'][-1]['status'] = 'error'
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='hi'), user_id='owner')
+    assert err.value.status_code in (404, 409)
+
+
+def test_youtube_refusing_a_reply_is_reported_and_nothing_is_recorded(world, google):
+    cid = _signed_in_connection(world)
+    google['reply_status'] = 403
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='hi'), user_id='owner')
+    assert err.value.status_code == 422 and 'would not accept' in err.value.detail
+    assert not [s for s in world.tables['signals'] if s['name'] == 'reply_sent']
+
+
+def test_there_is_a_daily_limit_on_replies(world, google, monkeypatch):
+    cid = _signed_in_connection(world)
+    monkeypatch.setattr(conn_router, 'MAX_REPLIES_PER_DAY', 2)
+    for n in range(2):
+        google['posts'].clear()
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id=f'c{n}', text='hi'), user_id='owner')
+        world.tables['signals'][-1]['dedupe_key'] = f'unique-{n}'
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id='c5', text='hi'), user_id='owner')
+    assert err.value.status_code == 429
+
+
+def test_another_organization_cannot_reply_through_my_connection(world, google):
+    cid = _signed_in_connection(world)
+    with pytest.raises(HTTPException) as err:
+        conn_router.reply(cid, conn_router.ReplyBody(parent_id='c9', text='hi'), user_id='other')
+    assert err.value.status_code in (403, 404)
+
+
+def test_disconnecting_a_signed_in_connection_withdraws_the_approval_at_google(world, google):
+    cid = _signed_in_connection(world)
+    conn_router.disconnect(cid, user_id='owner')
+    assert google['revoked'] == ['refresh-123'] and world.tables['connections'] == [] and world.tables['connection_secrets'] == []
+
+
+def test_the_provider_list_describes_sign_in_and_reply_support(world, google):
+    listed = {p['provider']: p for p in conn_router.providers(user_id='member')['providers']}
+    assert listed['youtube_account']['auth'] == 'oauth' and listed['youtube_account']['can_reply'] is True and listed['youtube_account']['available'] is True
+    assert listed['youtube_public']['auth'] == 'none' and listed['youtube_public']['can_reply'] is False

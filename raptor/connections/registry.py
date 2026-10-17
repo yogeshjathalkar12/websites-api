@@ -49,6 +49,8 @@ class Connector:
     title: str = ""
     description: str = ""
     category: str = "data"               # 'data' | 'channel' | 'alerts'
+    auth: str = "none"                   # 'none' (a form), 'oauth' (the person signs in with the provider and approves access)
+    can_reply: bool = False              # the connector can post a reply for the person (reply() is implemented)
     fields: list = []
     # Environment variables this connector needs ON THE SERVER (a shared key we pay for). Empty when the user brings everything.
     server_env: tuple = ()
@@ -65,9 +67,23 @@ class Connector:
     def sync(self, connection: dict, secret: Optional[str]) -> list:   # -> list[Signal]
         raise NotImplementedError
 
+    # --- sign-in connectors (auth == 'oauth') ---
+    def authorize_url(self, state: str, redirect_uri: str) -> str:
+        raise NotImplementedError
+
+    def complete(self, code: str, redirect_uri: str) -> ConnectResult:   # after the person approved: code -> a stored connection
+        raise NotImplementedError
+
+    def revoke(self, secret: Optional[str]) -> None:                  # best effort, when the connection is removed
+        return None
+
+    def reply(self, connection: dict, secret: Optional[str], parent_id: str, text: str) -> str:   # -> id of the posted reply
+        raise ConnectorError("This connection cannot post replies.")
+
     def describe(self) -> dict:
         return {
             "provider": self.provider, "title": self.title, "description": self.description, "category": self.category,
+            "auth": self.auth, "can_reply": self.can_reply,
             "available": self.available(), "min_sync_interval": self.min_sync_interval,
             "fields": [f.__dict__ for f in self.fields],
         }
@@ -87,5 +103,5 @@ def get(provider: str) -> Optional[Connector]:
 
 def load_all() -> dict:
     """Imports every connector module (each registers itself). Kept in one place so adding a channel is one line here."""
-    from . import youtube  # noqa: F401
+    from . import youtube, youtube_account  # noqa: F401
     return REGISTRY
