@@ -25,6 +25,7 @@ from raptor.playground.router import router as playground_router
 from raptor.crm.automations_router import router as automations_router
 from raptor.billing_router import router as billing_router
 from raptor.team_router import router as team_router
+from raptor.connections.router import router as connections_router
 
 # Initialize the main API hub
 app = FastAPI(title="Websites Central API")
@@ -125,6 +126,7 @@ app.include_router(email_router, prefix="/api/raptor/email", tags=["Raptor - Ema
 app.include_router(whatsapp_router, prefix="/api/raptor/whatsapp", tags=["Raptor - WhatsApp Automation"])
 app.include_router(playground_router, prefix="/api/raptor/playground", tags=["Raptor - AI Playground"])
 app.include_router(team_router, prefix="/api/raptor/team", tags=["Raptor - Team"])
+app.include_router(connections_router, prefix="/api/raptor/connections", tags=["Raptor - Connections"])
 
 # crm/automations_router.py is a cron-driven background worker, not a
 # normal user-facing tool -- it's guarded by X-Automation-Secret (see
