@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 # Content Suite added after) -- each imported and mounted below.
 from raptor.raptor_router import router as raptor_router
 from raptor.relay_router import router as raptor_relay_router
+from raptor.search_router import router as raptor_search_router
 from raptor.utility.chronos_router import router as chronos_router
 from raptor.utility.kmeans_router import router as kmeans_router
 from raptor.utility.diagnostic_router import router as diagnostic_router
@@ -113,6 +114,8 @@ app.include_router(raptor_router, prefix="/api/raptor", tags=["Raptor"])
 # wss://<this-host>/api/raptor/relay/{client_id}. Never decodes audio or
 # touches the desktop's local DNA/Pattern data - pure connectivity.
 app.include_router(raptor_relay_router, prefix="/api/raptor", tags=["Raptor - Mobile Relay"])
+# Web search for the desktop app (the SerpAPI key stays on the server): GET /api/raptor/search?query=... with the user's Supabase token.
+app.include_router(raptor_search_router, prefix="/api/raptor/search", tags=["Raptor - Search"])
 app.include_router(chronos_router, prefix="/api/raptor/chronos", tags=["Raptor - Chronos"])
 app.include_router(diagnostic_router, prefix="/api/raptor/diagnostic", tags=["Raptor - Deliverability Diagnostics"])
 app.include_router(kmeans_router, prefix="/api/raptor/kmeans", tags=["Raptor - K-Means"])
