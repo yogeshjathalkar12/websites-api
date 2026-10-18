@@ -12,6 +12,7 @@
   GET    /oauth/meta/callback     the same for Facebook: one sign-in makes a Facebook Page, a Lead Ads and an Instagram connection per shared Page
   POST   /{id}/reply         post a reply to a comment as the connected account {parent_id, text}
   POST   /{id}/action/{name} something a connection can do: send a test alert, send a text message {params}
+  POST   /{id}/draft-reply   a suggested answer to a comment or message, from the person's own AI key {text, author?, context?, kind?}; nothing is sent
   POST   /tick               cron only: sync every connection that is due
 
 Rules: everything belongs to the caller's ORGANIZATION (owner_id = org id). Connecting, changing and removing need the
@@ -19,6 +20,7 @@ manage_automations permission (the owner always has it) and the Pro plan. The br
 sees a secret; this file does the writing with the service role."""
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -495,6 +497,44 @@ def reply(connection_id: str, body: ReplyBody, user_id: str = Depends(get_curren
     return {"ok": True, "reply_id": posted}
 
 
+class DraftBody(BaseModel):
+    text: str
+    author: str = ""
+    context: str = ""
+    kind: str = "comment"
+
+
+DRAFT_LIMIT, DRAFT_WINDOW = 30, 600
+_draft_buckets: dict = {}
+_PLATFORM = {"youtube_account": "youtube", "youtube_public": "youtube", "meta_page": "facebook", "meta_instagram": "instagram"}
+
+
+@router.post("/{connection_id}/draft-reply")
+def draft_reply(connection_id: str, body: DraftBody, user_id: str = Depends(get_current_user)):
+    """A suggested answer to a comment or message, written by the person's own AI key. Nothing is sent or saved: the person edits it
+    and sends it through the normal reply."""
+    from . import drafting
+    org_id = _manager(user_id)
+    connection = _owned(org_id, connection_id)
+    connector = _connector(connection["provider"])
+    if not connector.can_reply:
+        raise HTTPException(status_code=400, detail="This connection cannot post replies.")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="There is nothing to answer.")
+    now = _now().timestamp()
+    recent = [t for t in _draft_buckets.get(user_id, []) if now - t < DRAFT_WINDOW]
+    if len(recent) >= DRAFT_LIMIT:
+        _draft_buckets[user_id] = recent
+        raise HTTPException(status_code=429, detail="That is a lot of drafts in a short time. Wait a few minutes.")
+    _draft_buckets[user_id] = recent + [now]
+    try:
+        return drafting.draft_reply(user_id, _PLATFORM.get(connection["provider"], "other"), "message" if body.kind == "message" else "comment",
+                                    connection.get("label") or "", body.author, text, body.context)
+    except ConnectorError as err:
+        raise HTTPException(status_code=422, detail=str(err))
+
+
 class PatchBody(BaseModel):
     label: Optional[str] = None
     paused: Optional[bool] = None
@@ -584,7 +624,7 @@ def signals(connection_id: str, limit: int = Query(100, ge=1, le=500), user_id: 
 
 def _require_cron_secret(x_automation_secret: str = Header(None)):
     secret = os.environ.get("AUTOMATION_CRON_SECRET")
-    if not secret or x_automation_secret != secret:
+    if not secret or not x_automation_secret or not hmac.compare_digest(x_automation_secret.encode(), secret.encode()):
         raise HTTPException(status_code=401, detail="Invalid or missing automation secret.")
 
 

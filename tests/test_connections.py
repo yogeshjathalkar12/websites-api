@@ -662,3 +662,15 @@ def test_the_provider_list_describes_sign_in_and_reply_support(world, google):
     listed = {p['provider']: p for p in conn_router.providers(user_id='member')['providers']}
     assert listed['youtube_account']['auth'] == 'oauth' and listed['youtube_account']['can_reply'] is True and listed['youtube_account']['available'] is True
     assert listed['youtube_public']['auth'] == 'none' and listed['youtube_public']['can_reply'] is False
+
+
+def test_the_scheduled_refresh_only_answers_to_the_shared_secret(monkeypatch):
+    monkeypatch.setenv('AUTOMATION_CRON_SECRET', 'cron-secret-123')
+    conn_router._require_cron_secret('cron-secret-123')                      # the right secret passes
+    for given in (None, '', 'wrong', 'cron-secret-12', 'cron-secret-1234'):
+        with pytest.raises(HTTPException) as err:
+            conn_router._require_cron_secret(given)
+        assert err.value.status_code == 401
+    monkeypatch.delenv('AUTOMATION_CRON_SECRET')
+    with pytest.raises(HTTPException):
+        conn_router._require_cron_secret('cron-secret-123')                  # no secret configured: nothing is accepted
