@@ -29,11 +29,13 @@ Endpoints:
   POST /crm/dispatch                — sends the WhatsApp messages the CRM pipeline queued (button / automatic mode)
   POST /sequences/{id}/enroll       — add contacts to a running sequence
   POST /reply                       — manual free-text reply from the CRM ContactPanel
+  POST /send-now                    — one message delivered immediately to any number (free text inside the 24h window, or an approved template)
   POST /tick                        — cron-only, advances broadcasts + due sequence steps
   GET  /webhook                     — Meta's one-time verification handshake
   POST /webhook                     — inbound messages: opt-out keywords, trigger matching, status updates
 """
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -562,6 +564,92 @@ def send_manual_reply(payload: dict = Body(...), user_id: str = Depends(get_curr
     _log_interaction(crm_contact_id, 'outbound', text)
 
     return {'ok': True, 'provider_message_id': message_id}
+
+
+# ---------------------------------------------------------------------------
+# Send one message right now (no scheduler, no queue)
+# ---------------------------------------------------------------------------
+
+SEND_NOW_LIMIT, SEND_NOW_WINDOW = 30, 600
+_send_now_times: dict = {}
+_TEMPLATE_NAME = re.compile(r'^[a-z0-9_]{1,512}$')
+_LANGUAGE = re.compile(r'^[a-z]{2,3}(_[A-Za-z]{2})?$')
+
+
+def _send_now_allowed(user_id: str) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    recent = [t for t in _send_now_times.get(user_id, []) if now - t < SEND_NOW_WINDOW]
+    if len(recent) >= SEND_NOW_LIMIT:
+        _send_now_times[user_id] = recent
+        return False
+    _send_now_times[user_id] = recent + [now]
+    return True
+
+
+@router.post("/send-now", dependencies=[Depends(pro_required)])
+def send_message_now(payload: dict = Body(...), user_id: str = Depends(get_current_user)):
+    """One WhatsApp message, delivered immediately, to any number.
+
+    Body: {"account_id", "phone", "text"}                                  free text: Meta only allows it if that person wrote to you
+                                                                           in the last 24 hours
+       or {"account_id", "phone", "template": {"name", "language", "params": [...]}}   an approved template: works at any time
+
+    This is the "I want it delivered now" path: nothing is queued and nothing waits for the tick. Opt-outs are still respected (a person who
+    wrote STOP is never messaged), and a person may send up to SEND_NOW_LIMIT of these per SEND_NOW_WINDOW seconds."""
+    account_id = str(payload.get('account_id') or '').strip()
+    phone = re.sub(r'\D', '', str(payload.get('phone') or ''))
+    text = str(payload.get('text') or '').strip()
+    template = payload.get('template') if isinstance(payload.get('template'), dict) else None
+    if not account_id:
+        raise HTTPException(status_code=400, detail="Choose which WhatsApp number to send from.")
+    if not 8 <= len(phone) <= 15:
+        raise HTTPException(status_code=400, detail="Enter the phone number with its country code, for example 919876543210.")
+    if bool(text) == bool(template):
+        raise HTTPException(status_code=400, detail="Send either a text message or an approved template, not both and not neither.")
+    if text and len(text) > 4096:
+        raise HTTPException(status_code=400, detail="A WhatsApp message can be up to 4096 characters.")
+    name = language = None
+    params: list = []
+    if template:
+        name = str(template.get('name') or '').strip()
+        language = str(template.get('language') or 'en_US').strip()
+        params = template.get('params') if isinstance(template.get('params'), list) else []
+        if not _TEMPLATE_NAME.match(name):
+            raise HTTPException(status_code=400, detail="Type the template's name exactly as it appears in WhatsApp Manager (lowercase letters, numbers and underscores).")
+        if not _LANGUAGE.match(language):
+            raise HTTPException(status_code=400, detail="The template language looks like en_US or hi.")
+        params = [str(p).strip()[:1024] for p in params][:10]
+        if any(not p for p in params):
+            raise HTTPException(status_code=400, detail="Fill in every variable of the template.")
+
+    account = supabase.table('whatsapp_accounts').select('*').eq('id', account_id).limit(1).execute().data
+    account = account[0] if account else None
+    if not account:
+        raise HTTPException(status_code=404, detail="WhatsApp account not found.")
+    if account['owner_id'] != user_id:
+        raise HTTPException(status_code=403, detail="You don't own this WhatsApp account.")
+    if supabase.table('whatsapp_suppressions').select('id').eq('account_id', account_id).eq('phone', phone).limit(1).execute().data:
+        raise HTTPException(status_code=400, detail="This person has opted out, so they cannot be messaged.")
+    if not _send_now_allowed(user_id):
+        raise HTTPException(status_code=429, detail="That is a lot of messages in a short time. Wait a few minutes.")
+
+    try:
+        provider = _decrypted_provider(account)
+        message_id = provider.send_template(phone, name, language, params) if template else provider.send_text(phone, text)
+    except Exception as err:
+        if template:
+            raise HTTPException(status_code=400, detail=f"Meta did not accept the template. Check its name, language and number of variables against WhatsApp Manager, and that it is approved. ({str(err)[:200]})")
+        raise HTTPException(status_code=400, detail=f"Meta did not accept this message. A free text can only be sent within 24 hours of the person's last message: use an approved template instead. ({str(err)[:200]})")
+
+    shown = f"[Template: {name}] " + ", ".join(params) if template else text
+    crm_contact_id = _crm_contact_id_for(account_id, phone)
+    conversation_id = _touch_conversation(account_id, phone, 'outbound', shown, crm_contact_id, agent_id=user_id)
+    supabase.table('whatsapp_events').insert({
+        'account_id': account_id, 'contact_phone': phone, 'direction': 'outbound',
+        'event_type': 'sent', 'body_text': shown, 'provider_message_id': message_id, 'conversation_id': conversation_id,
+    }).execute()
+    _log_interaction(crm_contact_id, 'outbound', shown)
+    return {'ok': True, 'provider_message_id': message_id, 'mode': 'template' if template else 'text'}
 
 
 # ---------------------------------------------------------------------------
