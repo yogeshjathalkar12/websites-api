@@ -9,6 +9,7 @@
   GET    /{id}/signals       the latest signals of one connection
   POST   /oauth/start        begin "sign in with Google" for a connector that needs it -> {url}
   GET    /oauth/google/callback   where Google sends the person back; finishes the connection, then returns them to the app
+  GET    /oauth/meta/callback     the same for Facebook: one sign-in makes a Facebook Page, a Lead Ads and an Instagram connection per shared Page
   POST   /{id}/reply         post a reply to a comment as the connected account {parent_id, text}
   POST   /{id}/action/{name} something a connection can do: send a test alert, send a text message {params}
   POST   /tick               cron only: sync every connection that is due
@@ -18,6 +19,7 @@ manage_automations permission (the owner always has it) and the Pro plan. The br
 sees a secret; this file does the writing with the service role."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -38,7 +40,7 @@ from .registry import ConnectorError
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-MAX_CONNECTIONS_PER_ORG = 25
+MAX_CONNECTIONS_PER_ORG = 100      # one Facebook sign-in makes up to three per shared Page
 MAX_REPLIES_PER_DAY = 50           # per connection: a safety net against a runaway client, far above what a person writes by hand
 MAX_REPLY_LENGTH = 10000
 OAUTH_STATE_SECONDS = 600
@@ -167,7 +169,11 @@ def _context(connection: dict) -> registry.Context:
         today = _now().strftime("%Y-%m-%d")
         return sum(1 for r in rows if str(r.get("occurred_at", ""))[:10] == today)
 
-    return registry.Context(count_today, lambda signal: _store_signals(connection, [signal]), connection["owner_id"])
+    def recent(name: str, limit: int = 200) -> list:
+        return (_db().table("signals").select("entity,occurred_at").eq("connection_id", connection["id"]).eq("name", name)
+                .order("occurred_at", desc=True).limit(limit).execute().data or [])
+
+    return registry.Context(count_today, lambda signal: _store_signals(connection, [signal]), connection["owner_id"], recent)
 
 
 def _run_sync(connection: dict) -> int:
@@ -240,14 +246,77 @@ def receive_push(token: str, body: bytes, headers: dict) -> dict:
     return {"ok": True, "received": len(fresh)}
 
 
+META_PUSH_MAX = 1_000_000
+
+
+def receive_meta(body: bytes, headers: dict) -> dict:
+    """What Meta pushes for connected Pages and Instagram accounts (messages, comments, new leads). The signature is checked first, with the
+    app secret. Each entry is handed to the connections of that Page or account. If reading something fails in a way a second delivery could
+    fix (Facebook busy), the answer is 503 so Meta sends it again; anything already stored is skipped the second time (dedupe)."""
+    from . import meta
+    if len(body) > META_PUSH_MAX:
+        raise HTTPException(status_code=413, detail="Too large.")
+    if not meta.enabled() or not meta.verify_signature(body, headers):
+        raise HTTPException(status_code=401, detail="Invalid signature.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Not valid JSON.")
+    obj = (payload or {}).get("object")
+    if obj not in ("page", "instagram"):
+        return {"ok": True, "received": 0}
+    db, received, retry = _db(), 0, False
+    for entry in payload.get("entry") or []:
+        ext = str(entry.get("id") or "")
+        if not ext:
+            continue
+        rows = db.table("connections").select("*").in_("provider", list(meta.META_PROVIDERS)).eq("external_id", ext).execute().data or []
+        for connection in rows:
+            connector = registry.get(connection["provider"])
+            if not connector or connection.get("status") == "paused":
+                continue
+            try:
+                signals, _ = connector.ingest_meta(connection, _secret_of(connection["id"]), obj, entry)
+            except ConnectorError as err:
+                db.table("connections").update({"last_error": str(err)[:400], "updated_at": _now().isoformat(),
+                                                **({"status": "error"} if str(err) == meta.EXPIRED else {})}).eq("id", connection["id"]).execute()
+                retry = retry or str(err) != meta.EXPIRED
+                continue
+            fresh = _store_signals(connection, signals)
+            received += len(fresh)
+            if fresh:
+                now = _now().isoformat()
+                db.table("connections").update({"status": "connected", "last_error": None, "last_sync_at": now, "updated_at": now}).eq("id", connection["id"]).execute()
+                _alert(connection, alert_engine.derive_alerts(connector.provider, fresh))
+    if retry:
+        raise HTTPException(status_code=503, detail="Try again.")
+    return {"ok": True, "received": received}
+
+
+def forget_facebook_user(fb_user_id: str) -> int:
+    """Removes every connection (and with it the saved access and the stored messages and leads) that was made by this Facebook person.
+    Used by Meta's data-deletion and deauthorize callbacks. Contacts someone already added to a CRM belong to that organization and stay."""
+    from . import meta
+    db, removed = _db(), 0
+    rows = db.table("connections").select("id,config,provider").in_("provider", list(meta.META_PROVIDERS)).limit(5000).execute().data or []
+    for row in rows:
+        if str((row.get("config") or {}).get("fb_user_id")) == str(fb_user_id):
+            db.table("connections").delete().eq("id", row["id"]).execute()
+            removed += 1
+    return removed
+
+
 def _web_app_connections_url(**params) -> str:
     base = os.environ.get("WEB_APP_URL", "https://shoonyaorigins.com/ventures/raptor/app/").rstrip("/") + "/"
     return f"{base}#/connections" + ("?" + urlencode(params) if params else "")
 
 
-def _store_connection(org_id: str, user_id: str, connector, result, label: Optional[str] = None) -> dict:
+def _store_connection(org_id: str, user_id: str, connector, result, label: Optional[str] = None, first_sync: bool = True) -> dict:
     """Saves a new connection (or, if this exact thing is already connected by signing in, refreshes its secret and wakes it up), then
-    fetches the first data. A failure of that first fetch is recorded on the connection and does not undo the connection."""
+    fetches the first data. A failure of that first fetch is recorded on the connection and does not undo the connection.
+    One sign-in can make several connections of different kinds (result.provider names the kind)."""
+    if result.provider and result.provider != connector.provider:
+        connector = _connector(result.provider)
     db = _db()
     existing = db.table("connections").select("id,provider,external_id").eq("owner_id", org_id).execute().data or []
     same = next((r for r in existing if r.get("provider") == connector.provider and r.get("external_id") == result.external_id), None)
@@ -276,7 +345,7 @@ def _store_connection(org_id: str, user_id: str, connector, result, label: Optio
         db.table("connections").update({"status": "error", "last_error": str(err)[:400], "updated_at": now}).eq("id", created["id"]).execute()
         log.warning("post-connect of %s failed: %s", connector.provider, err)
     else:
-        if connector.syncable:
+        if connector.syncable and first_sync:
             try:
                 _run_sync(full[0])
             except HTTPException as err:
@@ -289,7 +358,17 @@ def _store_connection(org_id: str, user_id: str, connector, result, label: Optio
 
 @router.get("/providers")
 def providers(user_id: str = Depends(get_current_user)):
-    return {"providers": [c.describe() for c in registry.REGISTRY.values()]}
+    try:
+        org_id, _ = _org(user_id)
+    except HTTPException:
+        org_id = user_id
+    out = []
+    for c in registry.REGISTRY.values():
+        d = c.describe()
+        if not c.allowed_for(org_id):
+            d["available"], d["restricted"] = False, True      # switched on for approved test accounts only
+        out.append(d)
+    return {"providers": out}
 
 
 @router.get("")
@@ -309,7 +388,7 @@ class ConnectBody(BaseModel):
 def connect(body: ConnectBody, user_id: str = Depends(get_current_user)):
     org_id = _manager(user_id)
     connector = _connector(body.provider)
-    if not connector.available():
+    if not connector.available() or not connector.allowed_for(org_id):
         raise HTTPException(status_code=503, detail=f"{connector.title} is not switched on for this Raptor server yet.")
     if connector.auth == "oauth":
         raise HTTPException(status_code=400, detail="This one connects by signing in. Use the sign-in button.")
@@ -334,16 +413,15 @@ def oauth_start(body: OAuthStartBody, user_id: str = Depends(get_current_user)):
     connector = _connector(body.provider)
     if connector.auth != "oauth":
         raise HTTPException(status_code=400, detail="This one does not use a sign-in.")
-    if not connector.available():
+    if not connector.available() or not connector.allowed_for(org_id):
         raise HTTPException(status_code=503, detail=f"{connector.title} is not switched on for this Raptor server yet.")
     state = vault.sign_state({"o": org_id, "u": user_id, "p": connector.provider})
-    return {"url": connector.authorize_url(state, google_oauth.redirect_uri())}
+    return {"url": connector.authorize_url(state, connector.redirect_uri())}
 
 
-@router.get("/oauth/google/callback", include_in_schema=False)
-def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
-    """Google sends the person's browser here after they approved (or refused). There is no login token on this request, so who
-    it is for comes from the signed, short-lived state made in oauth_start. Always ends by sending the person back to the app."""
+def _finish_oauth(code: str, state: str, error: str):
+    """The person's browser comes back here after approving (or refusing) at Google or Facebook. There is no login token on this request,
+    so who it is for comes from the signed, short-lived state made in oauth_start. Always ends by sending the person back to the app."""
     def back(**params):
         return RedirectResponse(_web_app_connections_url(**params), status_code=302)
 
@@ -355,13 +433,27 @@ def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
         connector = _connector(data["p"])
         if _manager(user_id) != org_id:
             raise HTTPException(status_code=403, detail="Your organization changed. Start again.")
-        result = connector.complete(code, google_oauth.redirect_uri())
-        connection = _store_connection(org_id, user_id, connector, result)
+        if not connector.available() or not connector.allowed_for(org_id):
+            raise HTTPException(status_code=503, detail=f"{connector.title} is not switched on for this Raptor server yet.")
+        results = connector.complete(code, connector.redirect_uri())
+        results = results if isinstance(results, list) else [results]
+        for result in results:
+            _store_connection(org_id, user_id, connector, result, first_sync=len(results) <= 9)
     except HTTPException as err:
         return back(oauth_error=str(err.detail))
     except (ConnectorError, KeyError) as err:
         return back(oauth_error=str(err) or "The sign-in could not be completed. Try again.")
-    return back(connected=connection["provider"])
+    return back(connected=connector.provider)
+
+
+@router.get("/oauth/google/callback", include_in_schema=False)
+def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
+    return _finish_oauth(code, state, error)
+
+
+@router.get("/oauth/meta/callback", include_in_schema=False)
+def oauth_meta_callback(code: str = "", state: str = "", error: str = ""):
+    return _finish_oauth(code, state, error)
 
 
 class ReplyBody(BaseModel):

@@ -33,10 +33,13 @@ ALERT_EVENTS = [
     {"value": "low_review", "label": "A review of 3 stars or less"},
     {"value": "rating_drop", "label": "The Google rating drops"},
     {"value": "buying_comment", "label": "Someone shows buying interest (a comment or a message)"},
-    {"value": "new_message", "label": "A message arrives on Telegram"},
+    {"value": "new_message", "label": "A message arrives (Telegram, Facebook or Instagram)"},
+    {"value": "new_lead", "label": "A new lead comes in from a Facebook or Instagram lead form"},
     {"value": "sync_error", "label": "A connection stops working"},
 ]
-DEFAULT_EVENTS = ["payment_received", "payment_failed", "low_review", "buying_comment", "sync_error"]
+DEFAULT_EVENTS = ["payment_received", "payment_failed", "low_review", "buying_comment", "new_lead", "sync_error"]
+PLACES = {"facebook_message": "Facebook message", "instagram_message": "Instagram message",
+          "facebook_comment": "Facebook comment", "instagram_comment": "Instagram comment"}
 _VALID_EVENTS = {e["value"] for e in ALERT_EVENTS}
 
 BUYING = re.compile(r"\b(price|pricing|prices|cost|how much|quote|quotation|buy|purchase|demo|trial|interested|where can i|discount|order|contact me|call me|whatsapp me|available in)\b", re.I)
@@ -80,6 +83,18 @@ def derive_alerts(provider: str, rows: list, previous_rating: Optional[float] = 
             who = entity.get("from") or "someone"
             events = ("buying_comment", "new_message") if BUYING.search(text) else ("new_message",)
             out.append(Alert(events, f'Telegram message from {who}: "{text[:240]}"'))
+        elif name in PLACES:
+            who = entity.get("from") or entity.get("author") or "someone"
+            is_comment = name.endswith("comment")
+            events = ("buying_comment",) if is_comment and BUYING.search(text) else ()
+            if not is_comment:
+                events = ("buying_comment", "new_message") if BUYING.search(text) else ("new_message",)
+            if events:
+                out.append(Alert(events, f'{PLACES[name]} from {who}: "{text[:240]}"'))
+        elif name == "lead":
+            bits = [entity.get(k) for k in ("name", "email", "phone") if entity.get(k)]
+            source = f" ({entity['campaign_name']})" if entity.get("campaign_name") else ""
+            out.append(Alert(("new_lead",), "New lead: " + (" · ".join(bits) or "see Raptor") + source))
     return out
 
 
