@@ -31,11 +31,18 @@ class Query:
         self.op, self.payload, self.upsert_keys, self.ignore = 'upsert', payload, on_conflict, ignore_duplicates
         return self
     def eq(self, col, val): self.filters.append((col, val)); return self
+    def in_(self, col, vals): self.filters.append((col, tuple(vals), 'in')); return self
     def limit(self, n): self._limit = n; return self
     def order(self, col, desc=False): self._order = (col, desc); return self
 
     def _match(self, row):
-        return all(row.get(c) == v for c, v in self.filters)
+        for f in self.filters:
+            if len(f) == 3:
+                if row.get(f[0]) not in f[1]:
+                    return False
+            elif row.get(f[0]) != f[1]:
+                return False
+        return True
 
     def execute(self):
         rows = self.db.tables.setdefault(self.t, [])

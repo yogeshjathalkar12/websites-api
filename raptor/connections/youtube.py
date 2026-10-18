@@ -187,6 +187,12 @@ class YouTubePublic(Connector):
                     "Your channel's @handle link. Open your channel on YouTube and copy the address.")]
     server_env = ("YOUTUBE_API_KEY",)
     min_sync_interval = 900
+    channel = "youtube"
+    help = [
+        "Open your channel on YouTube and copy its address (it looks like https://www.youtube.com/@yourchannel).",
+        "Paste it here. Nothing to sign in to: Raptor reads only the numbers anyone can see.",
+        "For private numbers (watch time, new subscribers) and to reply to comments, also connect “YouTube (sign in)”.",
+    ]
 
     def connect(self, inputs: dict) -> ConnectResult:
         kind, value = parse_channel_reference(inputs.get("channel", ""))

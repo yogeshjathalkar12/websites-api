@@ -10,6 +10,7 @@
   POST   /oauth/start        begin "sign in with Google" for a connector that needs it -> {url}
   GET    /oauth/google/callback   where Google sends the person back; finishes the connection, then returns them to the app
   POST   /{id}/reply         post a reply to a comment as the connected account {parent_id, text}
+  POST   /{id}/action/{name} something a connection can do: send a test alert, send a text message {params}
   POST   /tick               cron only: sync every connection that is due
 
 Rules: everything belongs to the caller's ORGANIZATION (owner_id = org id). Connecting, changing and removing need the
@@ -31,7 +32,7 @@ from pydantic import BaseModel
 from raptor.utility import raptor_auth
 from raptor.utility.raptor_auth import get_current_user, require_pro
 
-from . import google_oauth, registry, vault
+from . import alerts as alert_engine, google_oauth, registry, vault
 from .registry import ConnectorError
 
 log = logging.getLogger(__name__)
@@ -118,28 +119,125 @@ def _secret_of(connection_id: str) -> Optional[str]:
     return vault.decrypt_secret(rows[0]["encrypted_secret"]) if rows else None
 
 
+def _store_signals(connection: dict, signals: list) -> list:
+    """Saves signals, skipping any already stored (same dedupe key). Returns the rows that were NEW, which is what alerts are based on."""
+    if not signals:
+        return []
+    db = _db()
+    now = _now()
+    rows = [{
+        "owner_id": connection["owner_id"], "connection_id": connection["id"], "provider": connection["provider"],
+        "kind": s.kind, "name": s.name, "value": s.value, "text_value": s.text_value, "entity": s.entity or {},
+        "occurred_at": (s.occurred_at or now).isoformat(), "dedupe_key": s.dedupe_key,
+    } for s in signals]
+    keys = [r["dedupe_key"] for r in rows if r["dedupe_key"]]
+    known = set()
+    for start in range(0, len(keys), 200):
+        got = db.table("signals").select("dedupe_key").eq("connection_id", connection["id"]).in_("dedupe_key", keys[start:start + 200]).execute().data or []
+        known.update(r["dedupe_key"] for r in got)
+    fresh, seen = [], set()
+    for r in rows:
+        key = r["dedupe_key"]
+        if key and (key in known or key in seen):
+            continue
+        if key:
+            seen.add(key)
+        fresh.append(r)
+    for start in range(0, len(fresh), SYNC_CHUNK):
+        db.table("signals").upsert(fresh[start:start + SYNC_CHUNK], on_conflict="connection_id,dedupe_key", ignore_duplicates=True).execute()
+    return fresh
+
+
+def _alert(connection: dict, alerts: list) -> None:
+    """Tells the organization's alert channels. Never raises: an alert failing must not break collecting the data."""
+    try:
+        alert_engine.dispatch(_db(), connection["owner_id"], alerts, _secret_of)
+    except Exception:
+        log.exception("alert dispatch failed")
+
+
+def _previous_rating(connection: dict) -> Optional[float]:
+    rows = (_db().table("signals").select("value").eq("connection_id", connection["id"]).eq("name", "rating").order("occurred_at", desc=True).limit(1).execute().data or [])
+    return rows[0]["value"] if rows and rows[0].get("value") is not None else None
+
+
+def _context(connection: dict) -> registry.Context:
+    def count_today(name: str) -> int:
+        rows = _db().table("signals").select("occurred_at").eq("connection_id", connection["id"]).eq("name", name).limit(1000).execute().data or []
+        today = _now().strftime("%Y-%m-%d")
+        return sum(1 for r in rows if str(r.get("occurred_at", ""))[:10] == today)
+
+    return registry.Context(count_today, lambda signal: _store_signals(connection, [signal]), connection["owner_id"])
+
+
 def _run_sync(connection: dict) -> int:
-    """Fetches fresh signals, stores the new ones, records success or the user-readable error. Returns how many were fetched."""
+    """Fetches fresh signals, stores the new ones, records success or the user-readable error, and alerts on anything new.
+    Returns how many were fetched. The very first fetch of a connection sends no alerts: everything in it would look new."""
     connector = registry.get(connection["provider"])
     db = _db()
     now = _now()
     if not connector:
         db.table("connections").update({"status": "error", "last_error": "This connection type is no longer available.", "updated_at": now.isoformat()}).eq("id", connection["id"]).execute()
         raise HTTPException(status_code=410, detail="This connection type is no longer available.")
+    first_time = not connection.get("last_sync_at")
     try:
         signals = connector.sync(connection, _secret_of(connection["id"]))
     except ConnectorError as err:
         db.table("connections").update({"status": "error", "last_error": str(err)[:400], "updated_at": now.isoformat()}).eq("id", connection["id"]).execute()
+        if connection.get("status") != "error":
+            _alert(connection, [alert_engine.Alert(("sync_error",), f"{connection.get('label') or connector.title} stopped working: {str(err)[:200]}")])
         raise HTTPException(status_code=422, detail=str(err))
-    rows = [{
-        "owner_id": connection["owner_id"], "connection_id": connection["id"], "provider": connection["provider"],
-        "kind": s.kind, "name": s.name, "value": s.value, "text_value": s.text_value, "entity": s.entity or {},
-        "occurred_at": (s.occurred_at or now).isoformat(), "dedupe_key": s.dedupe_key,
-    } for s in signals]
-    for start in range(0, len(rows), SYNC_CHUNK):
-        db.table("signals").upsert(rows[start:start + SYNC_CHUNK], on_conflict="connection_id,dedupe_key", ignore_duplicates=True).execute()
+    previous = _previous_rating(connection) if connector.provider == "google_reviews" else None
+    fresh = _store_signals(connection, signals)
     db.table("connections").update({"status": "connected", "last_error": None, "last_sync_at": now.isoformat(), "updated_at": now.isoformat()}).eq("id", connection["id"]).execute()
-    return len(rows)
+    if not first_time:
+        _alert(connection, alert_engine.derive_alerts(connector.provider, fresh, previous))
+    return len(signals)
+
+
+# What other services push to us (payments, webhooks, Telegram messages). hooks.py is the only public door; it calls this.
+_PUSH_LIMIT, _PUSH_WINDOW = 120, 60
+_buckets: dict = {}
+
+
+def _push_allowed(token: str) -> bool:
+    now = _now().timestamp()
+    recent = [t for t in _buckets.get(token, []) if now - t < _PUSH_WINDOW]
+    if len(recent) >= _PUSH_LIMIT:
+        _buckets[token] = recent
+        return False
+    recent.append(now)
+    _buckets[token] = recent
+    return True
+
+
+def receive_push(token: str, body: bytes, headers: dict) -> dict:
+    from . import webhooks
+    if len(body) > webhooks.MAX_BODY:
+        raise HTTPException(status_code=413, detail="Too large.")
+    rows = _db().table("connections").select("*").eq("external_id", token).limit(1).execute().data or [] if len(token) >= 20 else []
+    connection = rows[0] if rows else None
+    connector = registry.get(connection["provider"]) if connection else None
+    if not connection or not connector or not connector.inbound:
+        raise HTTPException(status_code=404, detail="Not found.")
+    if connection["status"] == "paused":
+        raise HTTPException(status_code=409, detail="This connection is paused.")
+    if not _push_allowed(token):
+        raise HTTPException(status_code=429, detail="Too many messages. Slow down.")
+    try:
+        signals, patch = connector.ingest(connection, _secret_of(connection["id"]), body, headers)
+    except ConnectorError as err:
+        if str(err) == "signature":
+            raise HTTPException(status_code=401, detail="Invalid signature.")
+        raise HTTPException(status_code=400, detail=str(err))
+    fresh = _store_signals(connection, signals)
+    now = _now().isoformat()
+    update = {"status": "connected", "last_error": None, "last_sync_at": now, "updated_at": now}
+    if patch:
+        update["config"] = {**(connection.get("config") or {}), **patch}
+    _db().table("connections").update(update).eq("id", connection["id"]).execute()
+    _alert(connection, alert_engine.derive_alerts(connector.provider, fresh))
+    return {"ok": True, "received": len(fresh)}
 
 
 def _web_app_connections_url(**params) -> str:
@@ -173,9 +271,16 @@ def _store_connection(org_id: str, user_id: str, connector, result, label: Optio
         db.table("connection_secrets").insert({"connection_id": created["id"], "encrypted_secret": vault.encrypt_secret(result.secret)}).execute()
     full = db.table("connections").select("*").eq("id", created["id"]).limit(1).execute().data or [created]
     try:
-        _run_sync(full[0])
-    except HTTPException as err:
-        log.warning("first sync of %s failed: %s", connector.provider, err.detail)
+        connector.post_connect(full[0], result.secret)
+    except ConnectorError as err:
+        db.table("connections").update({"status": "error", "last_error": str(err)[:400], "updated_at": now}).eq("id", created["id"]).execute()
+        log.warning("post-connect of %s failed: %s", connector.provider, err)
+    else:
+        if connector.syncable:
+            try:
+                _run_sync(full[0])
+            except HTTPException as err:
+                log.warning("first sync of %s failed: %s", connector.provider, err.detail)
     fresh = db.table("connections").select(PUBLIC_FIELDS).eq("id", created["id"]).limit(1).execute().data or [created]
     return fresh[0]
 
@@ -301,13 +406,21 @@ def reply(connection_id: str, body: ReplyBody, user_id: str = Depends(get_curren
 class PatchBody(BaseModel):
     label: Optional[str] = None
     paused: Optional[bool] = None
+    settings: Optional[dict] = None
 
 
 @router.patch("/{connection_id}")
 def patch(connection_id: str, body: PatchBody, user_id: str = Depends(get_current_user)):
     org_id = _manager(user_id)
-    _owned(org_id, connection_id)
+    connection = _owned(org_id, connection_id)
     update = {"updated_at": _now().isoformat()}
+    if body.settings is not None:
+        connector = _connector(connection["provider"])
+        unknown = [k for k in body.settings if k not in connector.settings]
+        if unknown:
+            raise HTTPException(status_code=400, detail="That setting cannot be changed.")
+        cleaned = {k: (alert_engine.clean_events(v) if k == "events" else v) for k, v in body.settings.items()}
+        update["config"] = {**(connection.get("config") or {}), **cleaned}
     if body.label is not None:
         update["label"] = body.label.strip()[:120]
     if body.paused is not None:
@@ -323,9 +436,9 @@ def disconnect(connection_id: str, user_id: str = Depends(get_current_user)):
     org_id = _manager(user_id)
     connection = _owned(org_id, connection_id)
     connector = registry.get(connection["provider"])
-    if connector and connector.auth == "oauth":
+    if connector:
         try:
-            connector.revoke(_secret_of(connection_id))      # withdraw the person's approval at Google, best effort
+            connector.revoke(_secret_of(connection_id))      # withdraw what was set up (a Google approval, a Telegram webhook), best effort
         except Exception:
             log.warning("could not revoke access for connection %s", connection_id)
     _db().table("connections").delete().eq("id", connection_id).eq("owner_id", org_id).execute()   # secret + signals cascade
@@ -340,11 +453,32 @@ def sync_now(connection_id: str, user_id: str = Depends(get_current_user)):
     if connection["status"] == "paused":
         raise HTTPException(status_code=409, detail="This connection is paused. Resume it first.")
     connector = _connector(connection["provider"])
+    if not connector.syncable:
+        return {"signals": 0}
     last = _as_time(connection.get("last_sync_at"))
     if last and (_now() - last).total_seconds() < connector.min_sync_interval:
         wait = int(connector.min_sync_interval - (_now() - last).total_seconds())
         raise HTTPException(status_code=429, detail=f"Already refreshed a moment ago. Try again in {max(1, wait // 60)} min.")
     return {"signals": _run_sync(connection)}
+
+
+class ActionBody(BaseModel):
+    params: dict = {}
+
+
+@router.post("/{connection_id}/action/{name}")
+def run_action(connection_id: str, name: str, body: ActionBody, user_id: str = Depends(get_current_user)):
+    org_id = _manager(user_id)
+    connection = _owned(org_id, connection_id)
+    connector = _connector(connection["provider"])
+    if not any(a.name == name for a in connector.actions):
+        raise HTTPException(status_code=404, detail="This connection does not do that.")
+    if connection["status"] == "paused":
+        raise HTTPException(status_code=409, detail="This connection is paused. Resume it first.")
+    try:
+        return connector.action(connection, _secret_of(connection_id), name, body.params or {}, _context(connection))
+    except ConnectorError as err:
+        raise HTTPException(status_code=422, detail=str(err))
 
 
 @router.get("/{connection_id}/signals")
@@ -369,6 +503,9 @@ def tick():
     rows = _db().table("connections").select("*").eq("status", "connected").order("last_sync_at").limit(TICK_BATCH).execute().data or []
     done = failed = 0
     for row in rows:
+        connector = registry.get(row.get("provider"))
+        if not connector or not connector.syncable:
+            continue
         last = _as_time(row.get("last_sync_at"))
         if last and last > cutoff:
             continue

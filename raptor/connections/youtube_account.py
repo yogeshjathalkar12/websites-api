@@ -51,6 +51,12 @@ class YouTubeAccount(Connector):
     can_reply = True
     server_env = google_oauth.SERVER_ENV
     min_sync_interval = 900
+    channel = "youtube"
+    help = [
+        "Press “Sign in with Google” and choose the Google account that owns your YouTube channel.",
+        "Allow both permissions: reading comments and analytics, and replying to comments. Raptor never posts anything by itself: a reply is sent only when you press Send.",
+        "You come back here when it is done. Disconnecting withdraws Raptor's access in your Google account.",
+    ]
 
     def authorize_url(self, state: str, redirect_uri: str) -> str:
         return google_oauth.authorize_url(SCOPES, state, redirect_uri)
