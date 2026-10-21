@@ -100,3 +100,16 @@ def test_the_route_needs_a_signed_in_user_and_main_mounts_it(env):
 
     main_source = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "main.py"), encoding="utf-8").read()
     assert 'include_router(raptor_search_router, prefix="/api/raptor/search"' in main_source
+
+
+def test_a_location_and_country_are_passed_to_google_and_cleaned(env):
+    sr.search("dental clinics in Pune", location="  Pune,   Maharashtra, India ", gl="IN", user_id="u1")
+    assert env[0][1] == {"q": "dental clinics in Pune", "api_key": "serp-key", "location": "Pune, Maharashtra, India", "gl": "in"}
+
+
+def test_a_bad_country_code_or_a_huge_location_is_not_trusted(env):
+    sr.search("clinics", location="x" * 500, gl="india!", user_id="u1")
+    params = env[0][1]
+    assert "gl" not in params and len(params["location"]) == sr.MAX_LOCATION
+    sr.search("clinics", user_id="u1")
+    assert env[1][1] == {"q": "clinics", "api_key": "serp-key"}                    # no area: exactly as before

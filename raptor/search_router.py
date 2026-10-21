@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+from typing import Optional
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
@@ -27,6 +28,7 @@ SERPAPI_URL = "https://serpapi.com/search.json"
 PER_MINUTE = 40
 PER_DAY = 600
 MAX_QUERY = 500
+MAX_LOCATION = 120
 
 _calls: dict = {}          # user id -> list of call times (monotonic seconds), newest last
 _calls_lock = threading.Lock()
@@ -48,10 +50,14 @@ def _check_limits(user_id: str, now: float) -> None:
 
 
 @router.get("")
-def search(query: str, user_id: str = Depends(get_current_user)):
+def search(query: str, location: Optional[str] = None, gl: Optional[str] = None, user_id: str = Depends(get_current_user)):
+    """`location` ("Pune, Maharashtra, India") and `gl` (a two-letter country code) ask Google for that place; both are optional."""
     query = (query or "").strip()
     if not query or len(query) > MAX_QUERY:
         raise HTTPException(status_code=400, detail="Invalid query")
+    location = " ".join((location or "").split())[:MAX_LOCATION] or None
+    gl = (gl or "").strip().lower()
+    gl = gl if len(gl) == 2 and gl.isalpha() else None
 
     key = os.getenv("SERPAPI_KEY")
     if not key:
@@ -60,7 +66,12 @@ def search(query: str, user_id: str = Depends(get_current_user)):
     _check_limits(user_id, time.monotonic())
 
     try:
-        response = requests.get(SERPAPI_URL, params={"q": query, "api_key": key}, timeout=20)
+        params = {"q": query, "api_key": key}
+        if location:
+            params["location"] = location
+        if gl:
+            params["gl"] = gl
+        response = requests.get(SERPAPI_URL, params=params, timeout=20)
         response.raise_for_status()
     except requests.RequestException as e:
         log.error("SerpAPI request failed: %s", e)
