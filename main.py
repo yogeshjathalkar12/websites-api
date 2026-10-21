@@ -22,6 +22,7 @@ from raptor.utility.video_router import router as video_router
 from raptor.ai_integration.content_router import router as content_router
 from raptor.email.router import router as email_router
 from raptor.whatsapp.router import router as whatsapp_router
+from raptor.sms.router import router as sms_router
 from raptor.playground.router import router as playground_router
 from raptor.crm.automations_router import router as automations_router
 from raptor.billing_router import router as billing_router
@@ -128,6 +129,7 @@ app.include_router(video_router, prefix="/api/raptor/video", tags=["Raptor - Vid
 app.include_router(content_router, prefix="/api/raptor/content", tags=["Raptor - AI Content Suite"])
 app.include_router(email_router, prefix="/api/raptor/email", tags=["Raptor - Email Automation"])
 app.include_router(whatsapp_router, prefix="/api/raptor/whatsapp", tags=["Raptor - WhatsApp Automation"])
+app.include_router(sms_router, prefix="/api/raptor/sms", tags=["Raptor - SMS"])
 app.include_router(playground_router, prefix="/api/raptor/playground", tags=["Raptor - AI Playground"])
 app.include_router(team_router, prefix="/api/raptor/team", tags=["Raptor - Team"])
 app.include_router(connections_router, prefix="/api/raptor/connections", tags=["Raptor - Connections"])

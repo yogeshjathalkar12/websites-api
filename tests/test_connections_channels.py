@@ -731,32 +731,7 @@ def _sms_connection(world, web):
     return connect('sms_twilio', {'account_sid': SID, 'auth_token': 'tokentokentokentoken', 'from_number': '+14155550100'})
 
 
-def test_a_text_message_is_sent_from_the_customers_number_and_logged(world, web):
-    created = _sms_connection(world, web)
-    out = conn_router.run_action(created['id'], 'send', conn_router.ActionBody(params={'to': '+91 98765 43210', 'text': '  Hello Priya  '}), user_id='owner')
-    assert out == {'ok': True, 'sid': 'SM1'}
-    call = [c for c in web.posts('https://api.twilio.com') if 'Messages.json' in c['url']][0]
-    assert call['data'] == {'To': '+919876543210', 'From': '+14155550100', 'Body': 'Hello Priya'} and call['auth'] == (SID, 'tokentokentokentoken')
-    logged = signals_named(world, 'sms_sent')[0]
-    assert logged['entity']['to'] == '+919876543210' and logged['text_value'] == 'Hello Priya' and logged['kind'] == 'event'
-
-
-def test_sms_refuses_empty_oversized_unaddressed_and_rejected_messages_and_has_a_daily_cap(world, web, monkeypatch):
-    created = _sms_connection(world, web)
-    run = lambda **p: conn_router.run_action(created['id'], 'send', conn_router.ActionBody(params=p), user_id='owner')  # noqa: E731
-    for params, text in (({'to': '+919876543210', 'text': '  '}, 'Write the message'), ({'to': '+919876543210', 'text': 'x' * 601}, '600'),
-                         ({'to': '98765', 'text': 'hi'}, 'country code'), ({'to': '+919999999999', 'text': 'hi'}, 'not valid')):
-        with pytest.raises(HTTPException) as err:
-            run(**params)
-        assert err.value.status_code == 422 and text in err.value.detail
-    assert signals_named(world, 'sms_sent') == []
-    monkeypatch.setattr(sms, 'DAILY_CAP', 2)
-    for n in range(2):
-        run(to='+919876543210', text=f'msg {n}')
-        world.tables['signals'][-1]['dedupe_key'] = f'u{n}'
-    with pytest.raises(HTTPException) as err:
-        run(to='+919876543210', text='one more')
-    assert err.value.status_code == 422 and 'Daily' in err.value.detail
+# Sending, replies, STOP, sequences and auto-replies are tested in tests/test_sms_engine.py.
 
 
 # ───────────────────────── the catalogue the apps draw from ─────────────────────────
@@ -770,6 +745,6 @@ def test_every_new_channel_is_listed_with_its_tab_setup_steps_and_what_it_can_do
         assert p['channel'] == (tab if provider not in ('youtube_public', 'youtube_account') else p['channel'])
     assert listed['ga4']['fields'][1]['secret'] and listed['google_reviews']['fields'][1]['secret'] and listed['razorpay']['fields'][0]['secret']
     assert len(listed['slack']['help']) >= 3 and listed['slack']['extra']['events'][0]['value'] == 'payment_received'
-    assert [a['name'] for a in listed['slack']['actions']] == ['test_alert'] and [a['name'] for a in listed['sms_twilio']['actions']] == ['send']
+    assert [a['name'] for a in listed['slack']['actions']] == ['test_alert'] and listed['sms_twilio']['actions'] == []
     assert listed['razorpay']['inbound'] and not listed['razorpay']['syncable'] and listed['telegram']['inbound'] and listed['ga4']['syncable']
     assert all(set(p['fields'][i].keys()) >= {'name', 'label', 'secret', 'required'} for p in listed.values() for i in range(len(p['fields'])))

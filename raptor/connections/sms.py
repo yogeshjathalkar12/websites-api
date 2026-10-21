@@ -1,7 +1,8 @@
 """SMS with the customer's own Twilio account. Raptor sends a text message FROM their number using THEIR key, so the cost and the
 sender identity are theirs; the account SID and auth token are stored encrypted and never shown again.
 
-A daily cap per connection protects against a runaway sender, and every message sent is logged as a signal."""
+Sending, receiving replies, STOP handling, sequences and auto-replies live in raptor/sms (engine.py, router.py): this connector only
+checks the keys, stores them encrypted and points the Twilio number's incoming-message webhook at Raptor."""
 from __future__ import annotations
 
 import json
@@ -49,13 +50,11 @@ class Twilio(Connector):
     help = [
         "Create a Twilio account and buy or verify a phone number that can send SMS to your customers' country.",
         "From the Twilio console copy your Account SID and Auth token, and the number you will send from.",
-        "Paste them here. Raptor checks them with Twilio before saving.",
-        "Only text people who agreed to hear from you. In India, bulk marketing SMS also needs DLT registration with your carrier.",
+        "Paste them here. Raptor checks them with Twilio before saving, then points the number's incoming-message webhook at Raptor so replies and STOP reach you.",
+        "Only text people who agreed to hear from you. Texts go to one person at a time, and anyone who replies STOP is never texted again.",
+        "In India, marketing SMS also needs DLT registration of your sender and templates with your carrier.",
     ]
-    actions = [Action("send", "Send a text message", "Sends one message from your number.", [
-        Field("to", "To", "+919876543210", "With the country code."),
-        Field("text", "Message", "", f"Up to {MAX_TEXT} characters.", multiline=True),
-    ])]
+    actions = []
 
     def connect(self, inputs: dict) -> ConnectResult:
         sid = (inputs.get("account_sid") or "").strip()
@@ -75,33 +74,17 @@ class Twilio(Connector):
             raise ConnectorError("Twilio did not accept the request (%s)." % resp.status_code)
         return ConnectResult(external_id=sid, label=f"Twilio {from_number}", config={"from_number": from_number}, secret=json.dumps({"account_sid": sid, "auth_token": token}))
 
-    def action(self, connection: dict, secret: Optional[str], name: str, params: dict, ctx: Context) -> dict:
-        if name != "send":
-            raise ConnectorError("This connection does not do that.")
-        to = normalize_number(params.get("to") or "")
-        text = (params.get("text") or "").strip()
-        if not text:
-            raise ConnectorError("Write the message first.")
-        if len(text) > MAX_TEXT:
-            raise ConnectorError(f"A message can be up to {MAX_TEXT} characters.")
-        if ctx.count_today("sms_sent") >= DAILY_CAP:
-            raise ConnectorError("Daily message limit reached. Try again tomorrow.")
-        c = _creds(secret)
+    def post_connect(self, connection: dict, secret: Optional[str]) -> None:
+        """Best effort: point the number's "a message comes in" webhook at Raptor so replies and STOP arrive. If Twilio has no such number
+        on the account (a sender ID, a Messaging Service) the person pastes the address into Twilio themselves; the SMS page shows it."""
         try:
-            resp = httpx.post(f"{API}/{c.get('account_sid')}/Messages.json", auth=(c.get("account_sid", ""), c.get("auth_token", "")), timeout=20,
-                              data={"To": to, "From": (connection.get("config") or {}).get("from_number", ""), "Body": text})
-        except httpx.HTTPError:
-            raise ConnectorError("Could not reach Twilio right now. The message was not sent; try again.")
-        body = {}
-        try:
-            body = resp.json()
-        except ValueError:
-            pass
-        if resp.status_code not in (200, 201):
-            raise ConnectorError("Twilio did not send it: %s" % (body.get("message") or resp.status_code))
-        sid = body.get("sid") or ""
-        ctx.record(Signal("event", "sms_sent", text_value=text[:200], entity={"to": to, "sid": sid, "status": body.get("status", "")}, dedupe_key=f"sms:{sid}" if sid else None))
-        return {"ok": True, "sid": sid}
+            from raptor.connections import meta, router as connections_router
+            from raptor.sms import engine
+            ok = engine.configure_webhook(_creds(secret), (connection.get("config") or {}).get("from_number", ""),
+                                          engine.inbound_url(meta.public_api(), connection["id"]))
+            connections_router._db().table("connections").update({"config": {**(connection.get("config") or {}), "webhook_set": ok}}).eq("id", connection["id"]).execute()
+        except Exception:                                    # never blocks connecting
+            return None
 
 
 register(Twilio())
