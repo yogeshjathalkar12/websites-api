@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from raptor.raptor_router import router as raptor_router
 from raptor.relay_router import router as raptor_relay_router
 from raptor.search_router import router as raptor_search_router
+from raptor.audit.router import router as audit_router
 from raptor.utility.chronos_router import router as chronos_router
 from raptor.utility.kmeans_router import router as kmeans_router
 from raptor.utility.diagnostic_router import router as diagnostic_router
@@ -117,6 +118,8 @@ app.include_router(raptor_router, prefix="/api/raptor", tags=["Raptor"])
 app.include_router(raptor_relay_router, prefix="/api/raptor", tags=["Raptor - Mobile Relay"])
 # Web search for the desktop app (the SerpAPI key stays on the server): GET /api/raptor/search?query=... with the user's Supabase token.
 app.include_router(raptor_search_router, prefix="/api/raptor/search", tags=["Raptor - Search"])
+# Company Audit: a report on a company's website, domain, email set-up and visibility (raptor/audit/); every finding is measured and shows how to verify it.
+app.include_router(audit_router, prefix="/api/raptor/audit", tags=["Raptor - Company Audit"])
 app.include_router(chronos_router, prefix="/api/raptor/chronos", tags=["Raptor - Chronos"])
 app.include_router(diagnostic_router, prefix="/api/raptor/diagnostic", tags=["Raptor - Deliverability Diagnostics"])
 app.include_router(kmeans_router, prefix="/api/raptor/kmeans", tags=["Raptor - K-Means"])
