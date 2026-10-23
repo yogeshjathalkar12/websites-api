@@ -29,9 +29,11 @@ Raptor B2B/raptor-ui/src/relayBridge.js.
 No content is persisted. If a peer isn't connected, the sender gets an
 "error" control frame back instead of the message vanishing.
 """
+import asyncio
 import logging
 import os
 
+import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
@@ -56,6 +58,19 @@ _jwks_client = PyJWKClient(
 router = APIRouter()
 
 
+def _membership(token: str) -> dict:
+    """The web app's own answer for this person (my_membership(), asked with their token): status (active / invited / removed), the
+    organization's company id and plan. {} when it cannot be reached (then only the login's own claims count, as before)."""
+    try:
+        r = httpx.post(f"{SUPABASE_URL}/rest/v1/rpc/my_membership", json={}, timeout=6.0,
+                       headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        if r.status_code == 200:
+            return r.json() or {"status": "none"}
+    except Exception:
+        pass
+    return {}
+
+
 def _verify_token(token: str, client_id: str) -> dict:
     """Raises ValueError with a user-facing reason on failure."""
     try:
@@ -68,10 +83,19 @@ def _verify_token(token: str, client_id: str) -> dict:
     except (pyjwt.InvalidTokenError, pyjwt.exceptions.PyJWKClientError) as e:
         raise ValueError(f"Invalid session token: {e}")
 
-    if (payload.get("plan") or "Free").lower() != "pro":
+    # Access follows the web app's membership: a removed or unconfirmed person is out at once, a teammate works under the ORGANIZATION'S plan
+    # (they have no plan row of their own, so the login claim says Free for every one of them), and the company's own id is allowed for its
+    # active members (the "client_ids" claim only ever carries the placeholder 'default').
+    member = _membership(token)
+    status = member.get("status")
+    if status in ("removed", "invited"):
+        raise ValueError("Your access to this organization is not active. Contact your organization's owner.")
+    plan = (member.get("plan") if status == "active" and member.get("plan") else None) or payload.get("plan") or "Free"
+    if plan.lower() != "pro":
         raise ValueError("Live Copilot requires a Raptor Pro plan.")
     client_ids = set(payload.get("client_ids") or [])
-    if client_id not in client_ids:
+    of_the_organization = status == "active" and bool(member.get("client_id")) and member["client_id"] == client_id
+    if client_id not in client_ids and not of_the_organization:
         raise ValueError("You do not have access to this client's data.")
     return payload
 
@@ -101,7 +125,7 @@ async def relay(
         return
 
     try:
-        _verify_token(token, client_id)
+        await asyncio.to_thread(_verify_token, token, client_id)
     except ValueError as e:
         log.warning(f"Relay auth rejected for client {client_id} role {role}: {e}")
         await websocket.close(code=4401)
